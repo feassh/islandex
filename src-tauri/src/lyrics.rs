@@ -5,29 +5,84 @@ use tauri::{AppHandle, State};
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LyricPayload {
+    pub has_media: bool,
     pub is_playing: bool,
     pub title: String,
     pub artist: String,
+    pub album: String,
     pub line: String,
     pub song_id: Option<String>,
     pub source: String,
+    pub position_ms: i64,
+    pub duration_ms: i64,
+    pub cover_key: String,
 }
 
-pub struct LyricState(pub Arc<Mutex<LyricPayload>>);
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoverPayload {
+    pub cover_key: String,
+    pub data_url: Option<String>,
+}
+
+pub struct LyricState {
+    pub payload: Arc<Mutex<LyricPayload>>,
+    pub cover: Arc<Mutex<CoverPayload>>,
+}
 
 impl Default for LyricState {
     fn default() -> Self {
-        Self(Arc::new(Mutex::new(LyricPayload::default())))
+        Self {
+            payload: Arc::new(Mutex::new(LyricPayload::default())),
+            cover: Arc::new(Mutex::new(CoverPayload::default())),
+        }
     }
 }
 
 #[tauri::command]
 pub fn get_current_lyric(state: State<'_, LyricState>) -> LyricPayload {
     state
-        .0
+        .payload
         .lock()
         .map(|guard| guard.clone())
         .unwrap_or_default()
+}
+
+#[tauri::command]
+pub fn get_current_cover(state: State<'_, LyricState>) -> CoverPayload {
+    state
+        .cover
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+pub fn media_control(action: String) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows_impl::execute_control(&action)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = action;
+        Err("当前平台暂未实现 SMTC 媒体控制".to_string())
+    }
+}
+
+#[tauri::command]
+pub fn media_seek(position_ms: i64) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows_impl::execute_seek(position_ms)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = position_ms;
+        Err("当前平台暂未实现 SMTC 进度跳转".to_string())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -48,7 +103,6 @@ fn parse_lrc(raw: &str) -> Vec<LyricLine> {
             continue;
         }
 
-        // Check [offset:...] metadata tag
         if let Some(rest) = trimmed.strip_prefix("[offset:") {
             if let Some(val_str) = rest.strip_suffix(']') {
                 if let Ok(v) = val_str.trim().parse::<i64>() {
@@ -124,13 +178,11 @@ fn find_active_line(lines: &[LyricLine], position_ms: i64) -> Option<&str> {
     if lines.is_empty() {
         return None;
     }
-    // Slight +120ms anticipation so lyric changes land cleanly on the vocal beat
     let target = position_ms + 120;
     let idx = lines.partition_point(|line| line.time_ms <= target);
     if idx == 0 {
         return None;
     }
-    // Walk back past any blank spacer lines if the immediate line is empty
     let current = lines[idx - 1].text.trim();
     if !current.is_empty() {
         Some(current)
@@ -141,7 +193,7 @@ fn find_active_line(lines: &[LyricLine], position_ms: i64) -> Option<&str> {
 
 #[cfg(target_os = "windows")]
 mod windows_impl {
-    use super::{LyricLine, LyricPayload, find_active_line, parse_lrc};
+    use super::{CoverPayload, LyricLine, LyricPayload, find_active_line, parse_lrc};
     use serde::Deserialize;
     use std::collections::{HashMap, HashSet};
     use std::ffi::c_void;
@@ -152,6 +204,7 @@ mod windows_impl {
         GlobalSystemMediaTransportControlsSession, GlobalSystemMediaTransportControlsSessionManager,
         GlobalSystemMediaTransportControlsSessionPlaybackStatus,
     };
+    use windows::Storage::Streams::{DataReader, IRandomAccessStreamReference};
     use windows::Win32::Networking::WinHttp::{
         INTERNET_DEFAULT_HTTPS_PORT, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_ADDREQ_FLAG_ADD,
         WINHTTP_FLAG_SECURE, WinHttpAddRequestHeaders, WinHttpCloseHandle, WinHttpConnect,
@@ -166,9 +219,12 @@ mod windows_impl {
         is_playing: bool,
         title: String,
         artist: String,
+        album: String,
         song_id: Option<String>,
         position_ms: i64,
+        duration_ms: i64,
         source: String,
+        thumbnail: Option<IRandomAccessStreamReference>,
     }
 
     #[derive(Deserialize)]
@@ -196,6 +252,85 @@ mod windows_impl {
         id: u64,
     }
 
+    fn base64_encode(bytes: &[u8]) -> String {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        let mut i = 0;
+        while i + 3 <= bytes.len() {
+            let n = ((bytes[i] as u32) << 16)
+                | ((bytes[i + 1] as u32) << 8)
+                | (bytes[i + 2] as u32);
+            out.push(TABLE[((n >> 18) & 0x3F) as usize] as char);
+            out.push(TABLE[((n >> 12) & 0x3F) as usize] as char);
+            out.push(TABLE[((n >> 6) & 0x3F) as usize] as char);
+            out.push(TABLE[(n & 0x3F) as usize] as char);
+            i += 3;
+        }
+        let rem = bytes.len() - i;
+        if rem == 1 {
+            let n = (bytes[i] as u32) << 16;
+            out.push(TABLE[((n >> 18) & 0x3F) as usize] as char);
+            out.push(TABLE[((n >> 12) & 0x3F) as usize] as char);
+            out.push('=');
+            out.push('=');
+        } else if rem == 2 {
+            let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8);
+            out.push(TABLE[((n >> 18) & 0x3F) as usize] as char);
+            out.push(TABLE[((n >> 12) & 0x3F) as usize] as char);
+            out.push(TABLE[((n >> 6) & 0x3F) as usize] as char);
+            out.push('=');
+        }
+        out
+    }
+
+    fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
+        if bytes.len() >= 8 && bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+            Some("image/png")
+        } else if bytes.len() >= 3 && bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+            Some("image/jpeg")
+        } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+            Some("image/webp")
+        } else if bytes.len() >= 6 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
+            Some("image/gif")
+        } else if bytes.len() >= 2 && bytes.starts_with(b"BM") {
+            Some("image/bmp")
+        } else {
+            None
+        }
+    }
+
+    async fn read_thumbnail_data_url(
+        thumb: &IRandomAccessStreamReference,
+    ) -> Option<String> {
+        const MAX_COVER_BYTES: usize = 4 * 1024 * 1024;
+        let stream = thumb.OpenReadAsync().ok()?.await.ok()?;
+        let input = stream.GetInputStreamAt(0).ok()?;
+        let reader = DataReader::CreateDataReader(&input).ok()?;
+
+        // Read in chunks until EOF so network-backed WinRT streams never truncate
+        let mut bytes: Vec<u8> = Vec::new();
+        loop {
+            let remaining = MAX_COVER_BYTES.saturating_sub(bytes.len());
+            if remaining == 0 {
+                break;
+            }
+            let to_read = remaining.min(65_536) as u32;
+            let loaded = reader.LoadAsync(to_read).ok()?.await.ok()? as usize;
+            if loaded == 0 {
+                break;
+            }
+            let start = bytes.len();
+            bytes.resize(start + loaded, 0);
+            reader.ReadBytes(&mut bytes[start..]).ok()?;
+        }
+
+        // Sniff real image MIME from magic bytes (SMTC often reports "application/octet-stream")
+        let mime = detect_image_mime(&bytes)?;
+        let b64 = base64_encode(&bytes);
+        Some(format!("data:{};base64,{}", mime, b64))
+    }
+
     fn to_wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
@@ -214,7 +349,7 @@ mod windows_impl {
         out
     }
 
-    fn winhttp_get(host: &str, path: &str) -> Option<String> {
+    fn winhttp_get_bytes(host: &str, path: &str, https: bool) -> Option<Vec<u8>> {
         unsafe {
             let agent = to_wide("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Islandex/1.0");
             let session = WinHttpOpen(
@@ -229,12 +364,12 @@ mod windows_impl {
             }
 
             let host_w = to_wide(host);
-            let connect = WinHttpConnect(
-                session,
-                PCWSTR(host_w.as_ptr()),
-                INTERNET_DEFAULT_HTTPS_PORT,
-                0,
-            );
+            let port = if https {
+                INTERNET_DEFAULT_HTTPS_PORT
+            } else {
+                80
+            };
+            let connect = WinHttpConnect(session, PCWSTR(host_w.as_ptr()), port, 0);
             if connect.is_null() {
                 let _ = WinHttpCloseHandle(session);
                 return None;
@@ -242,6 +377,11 @@ mod windows_impl {
 
             let verb_w = to_wide("GET");
             let path_w = to_wide(path);
+            let flags = if https {
+                WINHTTP_FLAG_SECURE
+            } else {
+                Default::default()
+            };
             let request = WinHttpOpenRequest(
                 connect,
                 PCWSTR(verb_w.as_ptr()),
@@ -249,7 +389,7 @@ mod windows_impl {
                 PCWSTR::null(),
                 PCWSTR::null(),
                 std::ptr::null(),
-                WINHTTP_FLAG_SECURE,
+                flags,
             );
             if request.is_null() {
                 let _ = WinHttpCloseHandle(connect);
@@ -257,7 +397,7 @@ mod windows_impl {
                 return None;
             }
 
-            let headers = to_wide("Referer: https://music.163.com/\r\nAccept: application/json\r\n");
+            let headers = to_wide("Referer: https://music.163.com/\r\n");
             let _ = WinHttpAddRequestHeaders(
                 request,
                 &headers[..headers.len() - 1],
@@ -290,6 +430,9 @@ mod windows_impl {
                         break;
                     }
                     body.extend_from_slice(&chunk[..read as usize]);
+                    if body.len() > 4 * 1024 * 1024 {
+                        break;
+                    }
                 }
             }
 
@@ -297,12 +440,40 @@ mod windows_impl {
             let _ = WinHttpCloseHandle(connect);
             let _ = WinHttpCloseHandle(session);
 
-            if body.is_empty() {
-                None
-            } else {
-                String::from_utf8(body).ok()
-            }
+            if body.is_empty() { None } else { Some(body) }
         }
+    }
+
+    fn winhttp_get(host: &str, path: &str) -> Option<String> {
+        let bytes = winhttp_get_bytes(host, path, true)?;
+        String::from_utf8(bytes).ok()
+    }
+
+    fn fetch_ncm_cover_data_url(song_id: &str) -> Option<String> {
+        let detail_path = format!("/api/song/detail?id={0}&ids=[{0}]", song_id);
+        let json_text = winhttp_get("music.163.com", &detail_path)?;
+        let val: serde_json::Value = serde_json::from_str(&json_text).ok()?;
+        let pic_url = val
+            .get("songs")?
+            .as_array()?
+            .first()?
+            .get("album")?
+            .get("picUrl")?
+            .as_str()?;
+
+        let sized_url = format!("{}?param=240y240", pic_url.trim());
+        let (https, rest) = if let Some(r) = sized_url.strip_prefix("https://") {
+            (true, r)
+        } else if let Some(r) = sized_url.strip_prefix("http://") {
+            (false, r)
+        } else {
+            return None;
+        };
+        let (host, path) = rest.split_once('/')?;
+        let full_path = format!("/{}", path);
+        let bytes = winhttp_get_bytes(host, &full_path, https)?;
+        let mime = detect_image_mime(&bytes)?;
+        Some(format!("data:{};base64,{}", mime, base64_encode(&bytes)))
     }
 
     fn fetch_ncm_lyrics(song_id: Option<&str>, title: &str, artist: &str) -> Vec<LyricLine> {
@@ -366,6 +537,8 @@ mod windows_impl {
         let props = session.TryGetMediaPropertiesAsync().ok()?.await.ok()?;
         let title = props.Title().map(|s| s.to_string()).unwrap_or_default();
         let artist = props.Artist().map(|s| s.to_string()).unwrap_or_default();
+        let album = props.AlbumTitle().map(|s| s.to_string()).unwrap_or_default();
+        let thumbnail = props.Thumbnail().ok();
 
         // InfLink-rs embeds the exact NetEase Cloud Music song ID as "NCM-{ID}" in SMTC Genres
         let mut song_id: Option<String> = None;
@@ -402,12 +575,13 @@ mod windows_impl {
         }
 
         let mut position_ms: i64 = 0;
+        let mut duration_ms: i64 = 0;
         if let Ok(timeline) = session.GetTimelineProperties() {
             let base_ms = timeline
                 .Position()
                 .map(|t| t.Duration / 10_000)
                 .unwrap_or(0);
-            let end_ms = timeline
+            duration_ms = timeline
                 .EndTime()
                 .map(|t| t.Duration / 10_000)
                 .unwrap_or(0);
@@ -420,11 +594,10 @@ mod windows_impl {
             if is_playing && updated_ticks > 0 {
                 let now_ticks = now_filetime_100ns();
                 if now_ticks > updated_ticks {
-                    // Extrapolate live playback position between InfLink-rs's 1s SMTC timeline ticks
                     let elapsed_ms = ((now_ticks - updated_ticks) / 10_000).clamp(0, 15_000);
                     position_ms = base_ms + elapsed_ms;
-                    if end_ms > 0 && position_ms > end_ms {
-                        position_ms = end_ms;
+                    if duration_ms > 0 && position_ms > duration_ms {
+                        position_ms = duration_ms;
                     }
                 }
             }
@@ -434,19 +607,22 @@ mod windows_impl {
             is_playing,
             title,
             artist,
+            album,
             song_id,
-            position_ms,
+            position_ms: position_ms.max(0),
+            duration_ms: duration_ms.max(0),
             source: if is_inflink {
                 "inflink-rs".to_string()
             } else {
                 "smtc".to_string()
             },
+            thumbnail,
         })
     }
 
-    async fn poll_best_ncm_session(
+    async fn find_best_ncm_session(
         manager: &GlobalSystemMediaTransportControlsSessionManager,
-    ) -> Option<MediaSnapshot> {
+    ) -> Option<(GlobalSystemMediaTransportControlsSession, MediaSnapshot)> {
         let session_list: Vec<GlobalSystemMediaTransportControlsSession> = {
             let sessions = manager.GetSessions().ok()?;
             let count = sessions.Size().ok()?;
@@ -455,13 +631,12 @@ mod windows_impl {
                 .collect()
         };
 
-        let mut best: Option<(u8, MediaSnapshot)> = None;
-        for session in &session_list {
-            let Some(snap) = read_session_snapshot(session).await else {
+        let mut best: Option<(u8, GlobalSystemMediaTransportControlsSession, MediaSnapshot)> = None;
+        for session in session_list {
+            let Some(snap) = read_session_snapshot(&session).await else {
                 continue;
             };
 
-            // Priority: InfLink-rs playing > NCM playing > InfLink-rs paused > NCM paused
             let score = match (snap.source == "inflink-rs", snap.is_playing) {
                 (true, true) => 4,
                 (false, true) => 3,
@@ -469,20 +644,86 @@ mod windows_impl {
                 (false, false) => 1,
             };
 
-            if best.as_ref().is_none_or(|(best_score, _)| score > *best_score) {
-                best = Some((score, snap));
+            if best
+                .as_ref()
+                .is_none_or(|(best_score, _, _)| score > *best_score)
+            {
+                best = Some((score, session, snap));
             }
         }
 
-        best.map(|(_, snap)| snap)
+        best.map(|(_, session, snap)| (session, snap))
     }
 
-    pub fn spawn(app: AppHandle, shared_state: Arc<Mutex<LyricPayload>>) {
+    pub fn execute_control(action: &str) -> Result<(), String> {
+        let action_owned = action.to_string();
         std::thread::spawn(move || {
-            let cache: Arc<Mutex<HashMap<String, Vec<LyricLine>>>> =
+            let _ = tauri::async_runtime::block_on(async move {
+                let req = GlobalSystemMediaTransportControlsSessionManager::RequestAsync().ok()?;
+                let mgr = req.await.ok()?;
+                let (session, _) = find_best_ncm_session(&mgr).await?;
+                match action_owned.as_str() {
+                    "toggle" => {
+                        if let Ok(op) = session.TryTogglePlayPauseAsync() {
+                            let _ = op.await;
+                        }
+                    }
+                    "play" => {
+                        if let Ok(op) = session.TryPlayAsync() {
+                            let _ = op.await;
+                        }
+                    }
+                    "pause" => {
+                        if let Ok(op) = session.TryPauseAsync() {
+                            let _ = op.await;
+                        }
+                    }
+                    "next" => {
+                        if let Ok(op) = session.TrySkipNextAsync() {
+                            let _ = op.await;
+                        }
+                    }
+                    "previous" => {
+                        if let Ok(op) = session.TrySkipPreviousAsync() {
+                            let _ = op.await;
+                        }
+                    }
+                    _ => {}
+                }
+                Some(())
+            });
+        });
+        Ok(())
+    }
+
+    pub fn execute_seek(position_ms: i64) -> Result<(), String> {
+        let clamped_ticks = position_ms.max(0).saturating_mul(10_000);
+        std::thread::spawn(move || {
+            let _ = tauri::async_runtime::block_on(async move {
+                let req = GlobalSystemMediaTransportControlsSessionManager::RequestAsync().ok()?;
+                let mgr = req.await.ok()?;
+                let (session, _) = find_best_ncm_session(&mgr).await?;
+                if let Ok(op) = session.TryChangePlaybackPositionAsync(clamped_ticks) {
+                    let _ = op.await;
+                }
+                Some(())
+            });
+        });
+        Ok(())
+    }
+
+    pub fn spawn(
+        app: AppHandle,
+        shared_payload: Arc<Mutex<LyricPayload>>,
+        shared_cover: Arc<Mutex<CoverPayload>>,
+    ) {
+        std::thread::spawn(move || {
+            let lyric_cache: Arc<Mutex<HashMap<String, Vec<LyricLine>>>> =
                 Arc::new(Mutex::new(HashMap::new()));
             let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+            let mut cover_cache: HashMap<String, Option<String>> = HashMap::new();
             let mut last_payload = LyricPayload::default();
+            let mut last_cover_key = String::new();
 
             let mut manager: Option<GlobalSystemMediaTransportControlsSessionManager> = None;
 
@@ -498,13 +739,52 @@ mod windows_impl {
                 }
 
                 let payload = if let Some(ref mgr) = manager {
-                    if let Some(snap) = tauri::async_runtime::block_on(poll_best_ncm_session(mgr)) {
+                    if let Some((_, snap)) =
+                        tauri::async_runtime::block_on(find_best_ncm_session(mgr))
+                    {
                         let song_key = snap
                             .song_id
                             .clone()
                             .unwrap_or_else(|| format!("{}|{}", snap.title, snap.artist));
 
-                        let cached_lines = cache
+                        // Decode & cache album art once per song (SMTC thumbnail first, NCM API fallback)
+                        if !song_key.is_empty() && song_key != last_cover_key {
+                            let data_url = if let Some(cached) = cover_cache.get(&song_key) {
+                                cached.clone()
+                            } else {
+                                let from_smtc = match snap.thumbnail {
+                                    Some(ref thumb) => tauri::async_runtime::block_on(
+                                        read_thumbnail_data_url(thumb),
+                                    ),
+                                    None => None,
+                                };
+                                let decoded = from_smtc.or_else(|| {
+                                    snap.song_id
+                                        .as_deref()
+                                        .and_then(fetch_ncm_cover_data_url)
+                                });
+                                if decoded.is_some() {
+                                    cover_cache.insert(song_key.clone(), decoded.clone());
+                                }
+                                decoded
+                            };
+
+                            if data_url.is_some() || last_cover_key != song_key {
+                                if data_url.is_some() {
+                                    last_cover_key = song_key.clone();
+                                }
+                                let cover_payload = CoverPayload {
+                                    cover_key: song_key.clone(),
+                                    data_url,
+                                };
+                                if let Ok(mut guard) = shared_cover.lock() {
+                                    *guard = cover_payload.clone();
+                                }
+                                let _ = app.emit("island://cover", &cover_payload);
+                            }
+                        }
+
+                        let cached_lines = lyric_cache
                             .lock()
                             .ok()
                             .and_then(|map| map.get(&song_key).cloned());
@@ -516,7 +796,7 @@ mod windows_impl {
                                 .unwrap_or(false);
 
                             if should_fetch {
-                                let cache_bg = Arc::clone(&cache);
+                                let cache_bg = Arc::clone(&lyric_cache);
                                 let in_flight_bg = Arc::clone(&in_flight);
                                 let key_bg = song_key.clone();
                                 let id_bg = snap.song_id.clone();
@@ -553,12 +833,17 @@ mod windows_impl {
                         };
 
                         LyricPayload {
+                            has_media: !snap.title.is_empty() || snap.song_id.is_some(),
                             is_playing: snap.is_playing,
                             title: snap.title,
                             artist: snap.artist,
+                            album: snap.album,
                             line: active_line,
                             song_id: snap.song_id,
                             source: snap.source,
+                            position_ms: snap.position_ms,
+                            duration_ms: snap.duration_ms,
+                            cover_key: song_key,
                         }
                     } else {
                         LyricPayload::default()
@@ -569,7 +854,7 @@ mod windows_impl {
 
                 if payload != last_payload {
                     last_payload = payload.clone();
-                    if let Ok(mut guard) = shared_state.lock() {
+                    if let Ok(mut guard) = shared_payload.lock() {
                         *guard = payload.clone();
                     }
                     let _ = app.emit("island://lyric", &payload);
@@ -581,10 +866,14 @@ mod windows_impl {
     }
 }
 
-pub fn spawn_lyric_watcher(app: AppHandle, state: Arc<Mutex<LyricPayload>>) {
+pub fn spawn_lyric_watcher(
+    app: AppHandle,
+    payload: Arc<Mutex<LyricPayload>>,
+    cover: Arc<Mutex<CoverPayload>>,
+) {
     #[cfg(target_os = "windows")]
-    windows_impl::spawn(app, state);
+    windows_impl::spawn(app, payload, cover);
 
     #[cfg(not(target_os = "windows"))]
-    let _ = (app, state);
+    let _ = (app, payload, cover);
 }

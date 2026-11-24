@@ -654,7 +654,8 @@ pub fn run() {
     let tracker_mode = Arc::clone(&mode_state);
 
     let lyric_state = lyrics::LyricState::default();
-    let lyric_shared = Arc::clone(&lyric_state.0);
+    let lyric_shared = Arc::clone(&lyric_state.payload);
+    let cover_shared = Arc::clone(&lyric_state.cover);
 
     let clipboard_state = clipboard::ClipboardState::default();
     let clipboard_guard = Arc::clone(&clipboard_state.0);
@@ -673,6 +674,9 @@ pub fn run() {
             set_island_mode,
             open_settings_window,
             lyrics::get_current_lyric,
+            lyrics::get_current_cover,
+            lyrics::media_control,
+            lyrics::media_seek,
             settings::get_settings,
             settings::save_settings,
             settings::get_system_language,
@@ -690,7 +694,7 @@ pub fn run() {
                 position_top_center(&window);
                 spawn_cursor_tracker(window, tracker_hitbox, tracker_mode);
             }
-            lyrics::spawn_lyric_watcher(app.handle().clone(), lyric_shared);
+            lyrics::spawn_lyric_watcher(app.handle().clone(), lyric_shared, cover_shared);
             clipboard::spawn_clipboard_watcher(app.handle().clone(), clipboard_guard);
             Ok(())
         })

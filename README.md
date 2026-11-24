@@ -15,8 +15,8 @@
   - 动画静止时自动停止 `requestAnimationFrame`，空闲 CPU 占用趋近于零。
 - **动态形态切换**：
   - 默认收缩无附加内容时为 `32 × 32` 纯黑**圆形岛**；
-  - 当显示歌词或翻译询问等附加内容时，通过 `ResizeObserver` 实时测量布局宽度，以 Spring 动效自动拉伸为**胶囊态**；
-  - 无论收缩时为圆形还是胶囊态，鼠标悬停均统一展开为经典宽比例 **iOS 胶囊态**（`300 × 128`），内部 SVG 居中放大。
+  - 当显示歌词或翻译询问等附加内容时，通过 `ResizeObserver` 实时测量布局宽度，以 Spring 动效自动拉伸为**胶囊态**（左侧圆形图标与胶囊左端半圆严格同心对齐，四边保持均匀黑边）；
+  - 未播放音乐时悬停统一展开为经典宽比例 **iOS 胶囊态**（`300 × 128`），内部 SVG 居中放大；正在播放音乐时悬停则直接展开为**音乐控制面板**（`396 × 174`）。
 
 ### 2. Bloub 动画角色与全局鼠标微交互
 - **17 套纯白/纯黑单色 SVG 动画素材**：收录 `bloub-cercle` 全套 16 种表情动画及专为翻译状态定制的思考动画（`pensif`），已统一反转为纯白球体 + 纯黑眼睛以贴合纯黑灵动岛。
@@ -28,10 +28,14 @@
 - 收缩状态下在任意窗口按下键盘按键时，从岛体边缘向周围 **300° 范围**（严格排除正上方 60° 扇区，避免贴顶截断）随机角度辐射出对应迷你键帽，并自动错开相邻角度。
 - 键帽尺寸严格小于收缩岛体（高 `22px`、宽 `22–30px`），基于原生 Web Animations API 在 GPU 合成层完成弹出、轻微漂移与缓慢模糊淡出，高速打字零 React 重渲染。
 
-### 4. 网易云音乐实时歌词（对接 BetterNCM `InfLink-rs`）
-- 通过 Windows **SMTC**（`GlobalSystemMediaTransportControlsSessionManager`）优先匹配 BetterNCM 插件 **`InfLink-rs`** 上报的媒体会话（自动解析 `Genres` 中的 `NCM-{ID}` 歌曲 ID，并支持按歌名搜索兜底）。
-- 结合 SMTC 时间轴 `Position` 与 `LastUpdatedTime` 进行毫秒级播放进度外推插值，通过 Windows 原生 WinHTTP（自动走系统代理）拉取网易云歌词接口并解析 LRC 时间轴（带内存缓存）。
-- 播放时自动在收缩胶囊右侧展示实时歌词，胶囊随每句歌词长度弹性伸缩；暂停或关闭播放器后自动平滑收缩回圆形岛。
+### 4. 网易云音乐实时歌词与展开态歌曲控制面板（对接 BetterNCM `InfLink-rs`）
+- **SMTC 高精度同步**：通过 Windows **SMTC**（`GlobalSystemMediaTransportControlsSessionManager`）优先匹配 BetterNCM 插件 **`InfLink-rs`** 上报的媒体会话（自动解析 `Genres` 中的 `NCM-{ID}` 歌曲 ID，并支持按歌名搜索兜底）。
+- **收缩态实时歌词胶囊**：结合 SMTC 时间轴 `Position` 与 `LastUpdatedTime` 进行毫秒级播放进度外推插值，通过 Windows 原生 WinHTTP（自动走系统代理）拉取网易云歌词接口并解析 LRC 时间轴（带内存缓存）。播放时自动在收缩胶囊右侧展示实时歌词并随歌词长度弹性伸缩，暂停或关闭播放器后平滑收缩回圆形岛。
+- **展开态歌曲控制面板**：正在播放音乐时将鼠标移至灵动岛，不再展示默认 Bloub SVG，而是以 Spring 果冻动效展开为类 iOS 音乐控制面板（`396 × 174`，圆角 `40px`）：
+  - **高清专辑封面**：从 SMTC 缩略图分块读取并通过字节头自动识别真实 MIME 类型（内置网易云官方封面 API 兜底与切歌级缓存），暂停时自动微缩；
+  - **曲目资料与声波指示**：显示歌名、歌手 · 专辑名、当前实时歌词及动态声波动画；
+  - **交互式播放进度条**：实时显示当前进度与总时长，支持点击与拖拽跳转播放进度（`TryChangePlaybackPositionAsync`）；
+  - **真实媒体播放控制**：提供上一首、播放/暂停、下一首控制按钮（支持悬停内暂停后保持面板展开以便继续操作，移开鼠标再自然收起）。
 
 ### 5. 剪贴板监听与大模型流式翻译
 - **剪贴板实时监听与 10 秒限时询问**：监听系统剪贴板文本更新，在收缩态胶囊中展示倒计时询问（默认 `10s`，可在设置中自定义）；若点击 `✕` 或超时未选则自动恢复为歌词胶囊或圆形岛；应用自身写入剪贴板不会重复触发询问。
@@ -63,7 +67,7 @@ flowchart TB
 
     subgraph Rust["Tauri Rust 后端 (src-tauri)"]
         Lib["lib.rs\n窗口定位 · 穿透控制 · 托盘 · 键鼠轮询"]
-        Lyrics["lyrics.rs\nSMTC 会话匹配 · LRC 解析 · 进度同步"]
+        Lyrics["lyrics.rs\nSMTC 会话匹配 · 封面解码 · LRC 歌词 · 播放控制"]
         Clipboard["clipboard.rs\n剪贴板序列号监听 · 防自触发写入"]
         Translate["translate.rs\nWinHTTP SSE 流式翻译 · 取消控制"]
         Settings["settings.rs\n配置持久化 · 系统语言检测 · 开机自启"]
@@ -74,29 +78,31 @@ flowchart TB
         Island["DynamicIsland.tsx\n状态机 (normal / prompt / translating)"]
         Spring["physics/spring.ts\n240Hz 二阶弹簧物理 & 果冻形变"]
         Bloub["BloubAvatar.tsx\n3D 球面眼神追踪 & 眨眼"]
+        Music["MusicPlayerPanel.tsx\n封面 · 进度拖拽 · 播放控制"]
         Keys["KeyRadiator.tsx\n300° 迷你键帽粒子"]
         SettingsUI["SettingsPanel.tsx\n纯黑侧边栏设置面板"]
     end
 
     Cursor --> Lib
     Clip <--> Clipboard
-    SMTC --> Lyrics
+    SMTC <--> Lyrics
     Net <--> Lyrics
     Net <--> Translate
     Tray <--> Lib
     Tray <--> Settings
 
     Lib -- "island://hover · cursor · pulse · blink · key" --> Island
-    Lyrics -- "island://lyric" --> Island
+    Lyrics -- "island://lyric · cover" --> Island
     Clipboard -- "island://clipboard" --> Island
     Translate -- "island://translate-chunk · done · error" --> Island
-    Island -- "invoke: hitbox / mode / translate / copy" --> Rust
+    Island -- "invoke: hitbox / mode / media / translate / copy" --> Rust
     SettingsUI <-- "invoke: get_settings / save_settings" --> Settings
 
     Router --> Island
     Router --> SettingsUI
     Island --> Spring
     Island --> Bloub
+    Island --> Music
     Island --> Keys
 ```
 
@@ -114,13 +120,14 @@ flowchart TB
 | Rust → Web | `island://pulse` | 收缩态全局左键点击，触发岛体 Q 弹脉冲膨胀 |
 | Rust → Web | `island://blink` | 全局右键点击，触发小圆球主动眨眼 |
 | Rust → Web | `island://key` | 收缩态全局键盘按键事件，驱动 300° 键帽辐射 |
-| Rust → Web | `island://lyric` | 网易云实时歌词行与播放状态更新 |
+| Rust → Web | `island://lyric` / `island://cover` | 网易云曲目元数据、实时歌词、播放进度与切歌封面推送 |
 | Rust → Web | `island://clipboard` | 剪贴板新文本内容通知，触发限时翻译询问 |
 | Rust → Web | `island://translate-chunk` / `done` / `error` | 大模型 SSE 流式译文增量、完成与错误事件 |
 | Web → Rust | `update_island_hitbox` / `set_island_mode` | 同步实时收缩/展开命中矩形与交互模式（`normal` / `prompt` / `translating`） |
+| Web → Rust | `media_control` / `media_seek` | 控制网易云上一首、播放/暂停、下一首与进度条跳转 |
 | Web → Rust | `start_translation` / `cancel_translation` | 发起带单调 `requestId` 的流式翻译或中断当前请求 |
 | Web → Rust | `copy_to_clipboard` | 写入系统剪贴板并记录屏蔽标记，防止重复弹窗询问 |
-| Web → Rust | `get_current_lyric` | 初始化时主动拉取当前播放歌词 |
+| Web → Rust | `get_current_lyric` / `get_current_cover` | 初始化时主动拉取当前播放曲目、歌词与专辑封面 |
 | Web → Rust | `get_settings` / `save_settings` / `get_system_language` / `open_settings_window` | 读写持久化设置、读取系统默认语言及打开设置窗口 |
 
 ---
@@ -145,6 +152,7 @@ islandex/
 │   ├── components/
 │   │   ├── DynamicIsland.tsx           # 灵动岛核心容器、状态机与全局事件接入
 │   │   ├── BloubAvatar.tsx             # 3D 球面眼睛跟随与有机眨眼 SVG 组件
+│   │   ├── MusicPlayerPanel.tsx        # 展开态音乐控制面板（封面、进度条、切歌/暂停控制）
 │   │   ├── KeyRadiator.tsx             # 300° 迷你键帽辐射粒子组件
 │   │   ├── SettingsPanel.tsx           # 纯黑侧边栏设置面板（通用 / 翻译）
 │   │   └── SettingsPanel.css           # 设置面板样式
@@ -161,7 +169,7 @@ islandex/
     └── src/
         ├── main.rs                     # Windows Release 入口（隐藏控制台窗口）
         ├── lib.rs                      # 窗口贴顶居中、鼠标穿透、托盘菜单、全局键鼠轮询
-        ├── lyrics.rs                   # SMTC (InfLink-rs) 会话追踪、LRC 解析与歌词同步
+        ├── lyrics.rs                   # SMTC (InfLink-rs) 追踪、封面解码、LRC 歌词与媒体控制
         ├── clipboard.rs                # 系统剪贴板监听与防自触发写入
         ├── translate.rs                # OpenAI 兼容 SSE 流式翻译客户端
         └── settings.rs                 # 配置读写、本机语言识别与开机自启管理

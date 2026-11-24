@@ -11,23 +11,21 @@ import {
   ISLAND_TOP_OFFSET,
   IslandFrame,
   JellyIslandPhysics,
+  MUSIC_EXPANDED_METRICS,
   TRANSLATING_METRICS,
   computeIslandMetrics,
 } from "../physics/spring";
 import { BloubAvatar, BloubAvatarHandle, GazeTarget } from "./BloubAvatar";
 import { KeyRadiator, KeyRadiatorHandle } from "./KeyRadiator";
+import { MediaControlAction, MediaInfo, MusicPlayerPanel } from "./MusicPlayerPanel";
 
 function isTauriRuntime(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
-interface LyricPayload {
-  isPlaying: boolean;
-  title: string;
-  artist: string;
-  line: string;
-  songId: string | null;
-  source: string;
+interface CoverPayload {
+  coverKey: string;
+  dataUrl: string | null;
 }
 
 interface AppSettingsSummary {
@@ -53,6 +51,20 @@ interface TranslateErrorPayload {
 }
 
 type IslandPhase = "normal" | "prompt" | "translating";
+
+const EMPTY_MEDIA: MediaInfo = {
+  hasMedia: false,
+  isPlaying: false,
+  title: "",
+  artist: "",
+  album: "",
+  line: "",
+  songId: null,
+  source: "",
+  positionMs: 0,
+  durationMs: 0,
+  coverKey: "",
+};
 
 function formatBrowserKey(key: string): string | null {
   switch (key) {
@@ -117,15 +129,19 @@ export function DynamicIsland({
   const lastTimeRef = useRef<number | null>(null);
   const hoveredRef = useRef(false);
   const phaseRef = useRef<IslandPhase>("normal");
+  const musicExpandedRef = useRef(false);
+  const mediaRef = useRef<MediaInfo>(EMPTY_MEDIA);
   const useDomPointerRef = useRef(!isTauriRuntime());
-  const contentMeasureRef = useRef({ extraWidth: 0, activeSlots: 0 });
+  const contentMeasureRef = useRef({ extraWidth: 0, activeSlots: 0, rightOnly: false });
   const lastCollapsedSizeRef = useRef({ width: 32, height: 32 });
   const activeTranslateIdRef = useRef<number>(0);
   const promptTimeoutSecRef = useRef<number>(10);
 
   const [isExpanded, setIsExpandedState] = useState(false);
+  const [musicExpanded, setMusicExpandedState] = useState(false);
   const [phase, setPhaseState] = useState<IslandPhase>("normal");
-  const [lyricLine, setLyricLine] = useState("");
+  const [media, setMedia] = useState<MediaInfo>(EMPTY_MEDIA);
+  const [coverUrl, setCoverUrl] = useState<string | null>(null);
 
   // Clipboard prompt state
   const [clipboardText, setClipboardText] = useState("");
@@ -137,7 +153,9 @@ export function DynamicIsland({
   const [translateError, setTranslateError] = useState("");
   const [copied, setCopied] = useState(false);
 
+  const lyricLine = media.isPlaying ? media.line.trim() : "";
   const showThinkingSvg = phase === "translating" && isStreaming;
+  const showMusicPanel = phase === "normal" && isExpanded && musicExpanded;
   const useInteractiveEyes = !showThinkingSvg && emotion === DEFAULT_BLOUB_EMOTION;
 
   if (!physicsRef.current) {
@@ -193,12 +211,15 @@ export function DynamicIsland({
   const syncHitbox = useCallback(() => {
     const hostWidth = window.innerWidth || ISLAND_HOST_WIDTH;
     const maxWidth = hostWidth - 32;
-    const { extraWidth, activeSlots } = contentMeasureRef.current;
-    const collapsed = computeIslandMetrics(false, extraWidth, activeSlots, maxWidth);
+    const { extraWidth, activeSlots, rightOnly } = contentMeasureRef.current;
+    const collapsed = computeIslandMetrics(false, extraWidth, activeSlots, maxWidth, rightOnly);
+
     const expanded =
       phaseRef.current === "translating"
         ? TRANSLATING_METRICS
-        : computeIslandMetrics(true, 0, 0, maxWidth);
+        : musicExpandedRef.current || mediaRef.current.isPlaying
+          ? MUSIC_EXPANDED_METRICS
+          : computeIslandMetrics(true, 0, 0, maxWidth);
 
     lastCollapsedSizeRef.current = { width: collapsed.width, height: collapsed.height };
 
@@ -228,14 +249,16 @@ export function DynamicIsland({
       if (!physics) return;
 
       const hostWidth = window.innerWidth || ISLAND_HOST_WIDTH;
-      const { extraWidth, activeSlots } = contentMeasureRef.current;
+      const { extraWidth, activeSlots, rightOnly } = contentMeasureRef.current;
 
       const metrics =
         phaseRef.current === "translating"
           ? TRANSLATING_METRICS
           : expanded
-            ? computeIslandMetrics(true, 0, 0, hostWidth - 32)
-            : computeIslandMetrics(false, extraWidth, activeSlots, hostWidth - 32);
+            ? musicExpandedRef.current
+              ? MUSIC_EXPANDED_METRICS
+              : computeIslandMetrics(true, 0, 0, hostWidth - 32)
+            : computeIslandMetrics(false, extraWidth, activeSlots, hostWidth - 32, rightOnly);
 
       physics.setTarget(metrics, expanded || phaseRef.current === "translating");
       ensureAnimating();
@@ -253,10 +276,14 @@ export function DynamicIsland({
       }
 
       if (next === "translating") {
+        musicExpandedRef.current = false;
+        setMusicExpandedState(false);
         hoveredRef.current = true;
         setIsExpandedState(true);
         updateSpringTarget(true);
       } else {
+        musicExpandedRef.current = false;
+        setMusicExpandedState(false);
         hoveredRef.current = false;
         setIsExpandedState(false);
         updateSpringTarget(false);
@@ -271,10 +298,17 @@ export function DynamicIsland({
       if (phaseRef.current !== "normal") return;
       if (hoveredRef.current === expanded) return;
       hoveredRef.current = expanded;
+
+      // Enter music player mode when hovering while music is playing; keep it active until mouse leaves
+      const nextMusicExpanded = expanded && mediaRef.current.isPlaying;
+      musicExpandedRef.current = nextMusicExpanded;
+      setMusicExpandedState(nextMusicExpanded);
+
       setIsExpandedState(expanded);
       updateSpringTarget(expanded);
+      syncHitbox();
     },
-    [updateSpringTarget],
+    [syncHitbox, updateSpringTarget],
   );
 
   const triggerClickPulse = useCallback(() => {
@@ -290,6 +324,31 @@ export function DynamicIsland({
     if (phaseRef.current !== "normal" || hoveredRef.current) return;
     const { width, height } = lastCollapsedSizeRef.current;
     keyRadiatorRef.current?.emitKey(label, width, height);
+  }, []);
+
+  const handleMediaControl = useCallback((action: MediaControlAction) => {
+    if (action === "toggle") {
+      // Optimistic toggle so play/pause icon reacts immediately
+      setMedia((prev) => {
+        const next = { ...prev, isPlaying: !prev.isPlaying };
+        mediaRef.current = next;
+        return next;
+      });
+    }
+    if (isTauriRuntime()) {
+      invoke("media_control", { action }).catch(() => {});
+    }
+  }, []);
+
+  const handleMediaSeek = useCallback((positionMs: number) => {
+    setMedia((prev) => {
+      const next = { ...prev, positionMs };
+      mediaRef.current = next;
+      return next;
+    });
+    if (isTauriRuntime()) {
+      invoke("media_seek", { positionMs }).catch(() => {});
+    }
   }, []);
 
   const dismissPrompt = useCallback(() => {
@@ -403,7 +462,7 @@ export function DynamicIsland({
     };
   }, [applyFrame]);
 
-  // Sync current avatar DOM node size whenever the avatar element swaps (e.g. Bloub <-> Thinking SVG)
+  // Sync current avatar DOM node size whenever the avatar element swaps
   // without ever interrupting the active Spring RAF loop
   useEffect(() => {
     const physics = physicsRef.current;
@@ -414,7 +473,7 @@ export function DynamicIsland({
       imgAvatarRef.current.style.width = size;
       imgAvatarRef.current.style.height = size;
     }
-  }, [useInteractiveEyes, showThinkingSvg, phase]);
+  }, [useInteractiveEyes, showThinkingSvg, showMusicPanel, phase]);
 
   // Determine collapsed right-slot content: Clipboard Prompt takes priority over Live Lyrics
   const activeRightContent: ReactNode =
@@ -456,13 +515,15 @@ export function DynamicIsland({
       const rightWidth = rightSlotRef.current?.offsetWidth ?? 0;
       const activeSlots = (leftWidth > 0.5 ? 1 : 0) + (rightWidth > 0.5 ? 1 : 0);
       const extraWidth = leftWidth + rightWidth;
+      const rightOnly = leftWidth <= 0.5 && rightWidth > 0.5;
 
       const prev = contentMeasureRef.current;
       if (
         Math.abs(prev.extraWidth - extraWidth) > 0.5 ||
-        prev.activeSlots !== activeSlots
+        prev.activeSlots !== activeSlots ||
+        prev.rightOnly !== rightOnly
       ) {
-        contentMeasureRef.current = { extraWidth, activeSlots };
+        contentMeasureRef.current = { extraWidth, activeSlots, rightOnly };
         updateSpringTarget(false);
         syncHitbox();
       }
@@ -477,7 +538,7 @@ export function DynamicIsland({
     return () => observer.disconnect();
   }, [leftContent, activeRightContent, isExpanded, phase, syncHitbox, updateSpringTarget]);
 
-  // Sync logical hitbox with Rust and listen to global hover, gaze, clicks, keys, lyrics, clipboard & translation
+  // Sync logical hitbox with Rust and listen to global hover, gaze, clicks, keys, media, clipboard & translation
   useEffect(() => {
     if (!isTauriRuntime()) {
       const handlePointerMove = (e: PointerEvent) => {
@@ -522,6 +583,7 @@ export function DynamicIsland({
     let unlistenBlink: (() => void) | undefined;
     let unlistenKey: (() => void) | undefined;
     let unlistenLyric: (() => void) | undefined;
+    let unlistenCover: (() => void) | undefined;
     let unlistenClipboard: (() => void) | undefined;
     let unlistenChunk: (() => void) | undefined;
     let unlistenDone: (() => void) | undefined;
@@ -529,13 +591,28 @@ export function DynamicIsland({
     let unlistenFallback: (() => void) | undefined;
     let active = true;
 
-    const applyLyricPayload = (payload: LyricPayload | null | undefined) => {
+    const applyMediaPayload = (payload: MediaInfo | null | undefined) => {
       if (!active || !payload) return;
-      setLyricLine(payload.isPlaying ? payload.line.trim() : "");
+      const wasPlaying = mediaRef.current.isPlaying;
+      mediaRef.current = payload;
+      setMedia(payload);
+
+      // Keep Rust's expanded hitbox synchronized if playback state changes while collapsed
+      if (wasPlaying !== payload.isPlaying) {
+        syncHitbox();
+      }
     };
 
-    invoke<LyricPayload>("get_current_lyric")
-      .then(applyLyricPayload)
+    invoke<MediaInfo>("get_current_lyric")
+      .then(applyMediaPayload)
+      .catch(() => {});
+
+    invoke<CoverPayload>("get_current_cover")
+      .then((c) => {
+        if (active && c) {
+          setCoverUrl(c.dataUrl ?? null);
+        }
+      })
       .catch(() => {});
 
     invoke<AppSettingsSummary>("get_settings")
@@ -587,16 +664,24 @@ export function DynamicIsland({
       else fn();
     });
 
-    listen<LyricPayload>("island://lyric", (event) => {
-      applyLyricPayload(event.payload);
+    listen<MediaInfo>("island://lyric", (event) => {
+      applyMediaPayload(event.payload);
     }).then((fn) => {
       if (active) unlistenLyric = fn;
       else fn();
     });
 
+    listen<CoverPayload>("island://cover", (event) => {
+      if (active && event.payload) {
+        setCoverUrl(event.payload.dataUrl ?? null);
+      }
+    }).then((fn) => {
+      if (active) unlistenCover = fn;
+      else fn();
+    });
+
     listen<ClipboardPayload>("island://clipboard", (event) => {
       if (!active || !event.payload?.text) return;
-      // Do not interrupt an active translation card; prompt cleanly in collapsed capsule
       if (phaseRef.current === "translating") return;
 
       invoke<AppSettingsSummary>("get_settings")
@@ -663,6 +748,7 @@ export function DynamicIsland({
       unlistenBlink?.();
       unlistenKey?.();
       unlistenLyric?.();
+      unlistenCover?.();
       unlistenClipboard?.();
       unlistenChunk?.();
       unlistenDone?.();
@@ -696,7 +782,7 @@ export function DynamicIsland({
       <KeyRadiator ref={keyRadiatorRef} />
       <div
         ref={islandRef}
-        className={`island-shell ${phase === "translating" ? "island-shell-translating" : ""}`}
+        className={`island-shell ${phase === "translating" || showMusicPanel ? "island-shell-panel" : ""}`}
         onPointerEnter={() => {
           if (useDomPointerRef.current) setExpanded(true);
         }}
@@ -749,8 +835,17 @@ export function DynamicIsland({
               </button>
             </div>
           </div>
+        ) : showMusicPanel ? (
+          <MusicPlayerPanel
+            media={media}
+            coverUrl={coverUrl}
+            onControl={handleMediaControl}
+            onSeek={handleMediaSeek}
+          />
         ) : (
-          <div className="island-content">
+          <div
+            className={`island-content ${!isExpanded && !leftContent && activeRightContent ? "island-content-capsule-left" : ""}`}
+          >
             {!isExpanded && leftContent ? (
               <div ref={leftSlotRef} className="island-slot">
                 {leftContent}

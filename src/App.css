@@ -94,6 +94,12 @@ body,
   width: max-content;
 }
 
+.island-content-capsule-left {
+  width: 100%;
+  justify-content: flex-start;
+  padding: 0 12px 0 1px;
+}
+
 .island-slot {
   display: inline-flex;
   align-items: center;
@@ -197,10 +203,253 @@ body,
   color: #ffffff;
 }
 
-/* Expanded streaming translation panel */
-.island-shell-translating {
+/* Expanded rich panels (translation & music player) */
+.island-shell-panel {
   align-items: stretch;
   justify-content: flex-start;
+}
+
+/* Expanded iOS-style music player panel */
+.island-music-panel {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 16px 22px 14px;
+  gap: 10px;
+  animation: panelFadeIn 0.24s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.island-music-header {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+}
+
+.island-music-cover {
+  width: 56px;
+  height: 56px;
+  border-radius: 13px;
+  overflow: hidden;
+  flex-shrink: 0;
+  background: #141416;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.14),
+    0 6px 16px rgba(0, 0, 0, 0.45);
+  transition: transform 0.28s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.island-music-cover.is-paused {
+  transform: scale(0.92);
+}
+
+.island-music-cover img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.island-music-cover-placeholder {
+  width: 26px;
+  height: 26px;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.island-music-meta {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.island-music-title {
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.25;
+  color: #ffffff;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.island-music-subtitle {
+  font-size: 12.5px;
+  line-height: 1.25;
+  color: rgba(255, 255, 255, 0.62);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.island-music-lyric-sub {
+  font-size: 11.5px;
+  line-height: 1.25;
+  color: rgba(255, 255, 255, 0.44);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.island-music-eq {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  height: 22px;
+  flex-shrink: 0;
+  padding-right: 2px;
+}
+
+.island-music-eq span {
+  width: 3px;
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.4);
+  transition: height 0.2s ease, background 0.2s ease;
+}
+
+.island-music-eq.is-playing span {
+  background: rgba(255, 255, 255, 0.9);
+  animation: musicEqBar 0.95s ease-in-out infinite;
+}
+
+.island-music-eq.is-playing span:nth-child(1) {
+  height: 14px;
+  animation-delay: 0s;
+}
+
+.island-music-eq.is-playing span:nth-child(2) {
+  height: 20px;
+  animation-delay: 0.16s;
+}
+
+.island-music-eq.is-playing span:nth-child(3) {
+  height: 12px;
+  animation-delay: 0.32s;
+}
+
+.island-music-eq.is-playing span:nth-child(4) {
+  height: 18px;
+  animation-delay: 0.48s;
+}
+
+.island-music-progress-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.island-music-time {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: rgba(255, 255, 255, 0.5);
+  min-width: 30px;
+}
+
+.island-music-time:last-child {
+  text-align: right;
+}
+
+.island-music-track {
+  flex: 1;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  touch-action: none;
+}
+
+.island-music-track-bg {
+  width: 100%;
+  height: 5px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.2);
+  overflow: hidden;
+  transition: height 0.16s ease, background 0.16s ease;
+}
+
+.island-music-track:hover .island-music-track-bg,
+.island-music-track.is-dragging .island-music-track-bg {
+  height: 7px;
+  background: rgba(255, 255, 255, 0.26);
+}
+
+.island-music-track-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: #ffffff;
+  transition: width 0.14s linear;
+}
+
+.island-music-track.is-dragging .island-music-track-fill {
+  transition: none;
+}
+
+.island-music-controls {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 28px;
+}
+
+.island-music-btn {
+  border: none;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.88);
+  width: 34px;
+  height: 34px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: transform 0.14s cubic-bezier(0.22, 1, 0.36, 1), background 0.15s ease, color 0.15s ease;
+}
+
+.island-music-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: #ffffff;
+}
+
+.island-music-btn:active {
+  transform: scale(0.86);
+}
+
+.island-music-btn-main {
+  width: 40px;
+  height: 40px;
+  color: #ffffff;
+}
+
+@keyframes musicEqBar {
+  0%,
+  100% {
+    transform: scaleY(0.35);
+    opacity: 0.6;
+  }
+  50% {
+    transform: scaleY(1);
+    opacity: 1;
+  }
+}
+
+@keyframes panelFadeIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+    filter: blur(4px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+    filter: blur(0);
+  }
 }
 
 .island-translate-panel {

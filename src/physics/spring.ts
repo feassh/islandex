@@ -88,12 +88,15 @@ export const ISLAND_HOST_WIDTH = 520;
 export const ISLAND_TOP_OFFSET = 10;
 
 // Compact circular default (32x32 with 30px SVG -> 24px white bloub inside a 4px black bezel).
-// When additional content slots are present, width automatically expands into a capsule.
+// When right-only content (lyrics / prompt) is present, left padding stays 1px so the 24px white
+// circle remains strictly concentric with the 16px left semicircle of the capsule.
 export const COLLAPSED_BASE = {
   height: 32,
   avatarSize: 30,
   circlePaddingX: 1, // 30 + 2 = 32 -> exact 32x32 circle when only SVG is shown
-  capsulePaddingX: 10, // horizontal breathing room on each side when extra content appears
+  capsulePaddingLeftConcentric: 1, // concentric 4px bezel (1px padding + 3px SVG viewBox margin)
+  capsulePaddingRight: 12, // breathing room after lyric text or prompt buttons
+  capsulePaddingX: 10, // symmetric padding when leftContent is also present
   contentGap: 6,
 };
 
@@ -113,18 +116,40 @@ export const TRANSLATING_METRICS: IslandMetrics = {
   avatarSize: 64,
 };
 
+export const MUSIC_EXPANDED_METRICS: IslandMetrics = {
+  width: 396,
+  height: 174,
+  radius: 40,
+  avatarSize: 64,
+};
+
 export function computeIslandMetrics(
   expanded: boolean,
   extraWidth: number,
   activeSlots: number,
   maxWidth: number = ISLAND_HOST_WIDTH - 32,
+  rightOnly: boolean = false,
 ): IslandMetrics {
   const hasExtra = extraWidth > 0.5 && activeSlots > 0;
 
   if (!expanded) {
-    const { height, avatarSize, circlePaddingX, capsulePaddingX, contentGap } = COLLAPSED_BASE;
+    const {
+      height,
+      avatarSize,
+      circlePaddingX,
+      capsulePaddingLeftConcentric,
+      capsulePaddingRight,
+      capsulePaddingX,
+      contentGap,
+    } = COLLAPSED_BASE;
     const rawWidth = hasExtra
-      ? avatarSize + extraWidth + activeSlots * contentGap + capsulePaddingX * 2
+      ? rightOnly
+        ? capsulePaddingLeftConcentric +
+          avatarSize +
+          contentGap +
+          extraWidth +
+          capsulePaddingRight
+        : avatarSize + extraWidth + activeSlots * contentGap + capsulePaddingX * 2
       : avatarSize + circlePaddingX * 2;
     const width = Math.min(Math.max(height, Math.ceil(rawWidth)), maxWidth);
 
