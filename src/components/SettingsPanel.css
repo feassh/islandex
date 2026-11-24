@@ -325,6 +325,11 @@ body.settings-mode #root {
   cursor: pointer;
 }
 
+.settings-select-inline {
+  width: 230px;
+  flex-shrink: 0;
+}
+
 .settings-select option {
   background: #0a0a0a;
   color: #ffffff;

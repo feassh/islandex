@@ -690,7 +690,8 @@ pub fn run() {
         ])
         .setup(move |app| {
             let loaded_settings = settings::load_settings_from_disk(app.handle());
-            app.manage(settings::SettingsState(Arc::new(Mutex::new(loaded_settings))));
+            let settings_shared = Arc::new(Mutex::new(loaded_settings));
+            app.manage(settings::SettingsState(Arc::clone(&settings_shared)));
 
             let _ = setup_system_tray(app.handle());
 
@@ -698,7 +699,12 @@ pub fn run() {
                 position_top_center(&window);
                 spawn_cursor_tracker(window, tracker_hitbox, tracker_mode);
             }
-            lyrics::spawn_lyric_watcher(app.handle().clone(), lyric_shared, cover_shared);
+            lyrics::spawn_lyric_watcher(
+                app.handle().clone(),
+                lyric_shared,
+                cover_shared,
+                settings_shared,
+            );
             clipboard::spawn_clipboard_watcher(app.handle().clone(), clipboard_guard);
             Ok(())
         })

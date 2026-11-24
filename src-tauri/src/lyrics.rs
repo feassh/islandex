@@ -1,3 +1,4 @@
+use crate::settings::{AppSettings, SettingsState};
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, State};
@@ -58,29 +59,41 @@ pub fn get_current_cover(state: State<'_, LyricState>) -> CoverPayload {
 }
 
 #[tauri::command]
-pub fn media_control(action: String) -> Result<(), String> {
+pub fn media_control(action: String, settings: State<'_, SettingsState>) -> Result<(), String> {
+    let source_pref = settings
+        .0
+        .lock()
+        .map(|g| g.music_source.clone())
+        .unwrap_or_else(|_| "auto".to_string());
+
     #[cfg(target_os = "windows")]
     {
-        windows_impl::execute_control(&action)
+        windows_impl::execute_control(&action, &source_pref)
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = action;
+        let _ = (action, source_pref);
         Err("当前平台暂未实现 SMTC 媒体控制".to_string())
     }
 }
 
 #[tauri::command]
-pub fn media_seek(position_ms: i64) -> Result<(), String> {
+pub fn media_seek(position_ms: i64, settings: State<'_, SettingsState>) -> Result<(), String> {
+    let source_pref = settings
+        .0
+        .lock()
+        .map(|g| g.music_source.clone())
+        .unwrap_or_else(|_| "auto".to_string());
+
     #[cfg(target_os = "windows")]
     {
-        windows_impl::execute_seek(position_ms)
+        windows_impl::execute_seek(position_ms, &source_pref)
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = position_ms;
+        let _ = (position_ms, source_pref);
         Err("当前平台暂未实现 SMTC 进度跳转".to_string())
     }
 }
@@ -91,8 +104,14 @@ struct LyricLine {
     text: String,
 }
 
-/// Parses standard NetEase Cloud Music LRC format (supports multi-timestamp lines,
-/// centiseconds/milliseconds, `[offset:ms]`, and skips JSON metadata lines).
+#[derive(Debug, Clone, Default)]
+struct CachedLyrics {
+    lines: Vec<LyricLine>,
+    fallback_duration_ms: i64,
+}
+
+/// Parses standard LRC format (supports multi-timestamp lines, centiseconds/milliseconds,
+/// `[offset:ms]`, and skips JSON metadata lines).
 fn parse_lrc(raw: &str) -> Vec<LyricLine> {
     let mut offset_ms: i64 = 0;
     let mut lines: Vec<LyricLine> = Vec::new();
@@ -174,11 +193,11 @@ fn parse_fraction_ms(frac: &str) -> Option<i64> {
     })
 }
 
-fn find_active_line(lines: &[LyricLine], position_ms: i64) -> Option<&str> {
+fn find_active_line(lines: &[LyricLine], position_ms: i64, lead_ms: i64) -> Option<&str> {
     if lines.is_empty() {
         return None;
     }
-    let target = position_ms + 120;
+    let target = position_ms + lead_ms;
     let idx = lines.partition_point(|line| line.time_ms <= target);
     if idx == 0 {
         return None;
@@ -191,14 +210,34 @@ fn find_active_line(lines: &[LyricLine], position_ms: i64) -> Option<&str> {
     }
 }
 
+/// Apple Music on Windows sometimes combines `"Artist — Album"` inside the SMTC `Artist` field
+/// while leaving `AlbumTitle` empty. Cleanly split them for display & accurate lyric search.
+fn normalize_artist_album(source: &str, artist: String, album: String) -> (String, String) {
+    if source == "apple-music" && album.trim().is_empty() {
+        for sep in [" — ", " – ", " - "] {
+            if let Some((left, right)) = artist.split_once(sep) {
+                let a = left.trim();
+                let b = right.trim();
+                if !a.is_empty() && !b.is_empty() {
+                    return (a.to_string(), b.to_string());
+                }
+            }
+        }
+    }
+    (artist, album)
+}
+
 #[cfg(target_os = "windows")]
 mod windows_impl {
-    use super::{CoverPayload, LyricLine, LyricPayload, find_active_line, parse_lrc};
+    use super::{
+        AppSettings, CachedLyrics, CoverPayload, LyricPayload, find_active_line,
+        normalize_artist_album, parse_lrc,
+    };
     use serde::Deserialize;
     use std::collections::{HashMap, HashSet};
     use std::ffi::c_void;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tauri::{AppHandle, Emitter};
     use windows::Media::Control::{
         GlobalSystemMediaTransportControlsSession, GlobalSystemMediaTransportControlsSessionManager,
@@ -209,7 +248,7 @@ mod windows_impl {
         INTERNET_DEFAULT_HTTPS_PORT, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_ADDREQ_FLAG_ADD,
         WINHTTP_FLAG_SECURE, WinHttpAddRequestHeaders, WinHttpCloseHandle, WinHttpConnect,
         WinHttpOpen, WinHttpOpenRequest, WinHttpQueryDataAvailable, WinHttpReadData,
-        WinHttpReceiveResponse, WinHttpSendRequest,
+        WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
     };
     use windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
     use windows::core::PCWSTR;
@@ -223,8 +262,68 @@ mod windows_impl {
         song_id: Option<String>,
         position_ms: i64,
         duration_ms: i64,
+        has_timeline: bool,
         source: String,
+        app_id: String,
         thumbnail: Option<IRandomAccessStreamReference>,
+    }
+
+    #[derive(Default)]
+    struct LocalTrackClock {
+        key: String,
+        accumulated_ms: i64,
+        running_since: Option<Instant>,
+    }
+
+    impl LocalTrackClock {
+        fn update(
+            &mut self,
+            key: &str,
+            is_playing: bool,
+            smtc_pos_ms: i64,
+            has_timeline: bool,
+        ) -> i64 {
+            if self.key != key {
+                self.key = key.to_string();
+                // Seed a small initial offset when using fallback clock to cover poll detection latency
+                self.accumulated_ms = if has_timeline { smtc_pos_ms } else { 200 };
+                self.running_since = if is_playing {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                return self.accumulated_ms;
+            }
+
+            if has_timeline {
+                self.accumulated_ms = smtc_pos_ms;
+                self.running_since = if is_playing {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                return smtc_pos_ms;
+            }
+
+            // Fallback clock when a player (e.g. certain Apple Music Win builds) reports 0 timeline
+            if is_playing {
+                if let Some(since) = self.running_since {
+                    self.accumulated_ms += since.elapsed().as_millis() as i64;
+                }
+                self.running_since = Some(Instant::now());
+            } else {
+                if let Some(since) = self.running_since.take() {
+                    self.accumulated_ms += since.elapsed().as_millis() as i64;
+                }
+            }
+            self.accumulated_ms.max(0)
+        }
+
+        fn reset(&mut self) {
+            self.key.clear();
+            self.accumulated_ms = 0;
+            self.running_since = None;
+        }
     }
 
     #[derive(Deserialize)]
@@ -250,6 +349,14 @@ mod windows_impl {
     #[derive(Deserialize)]
     struct NcmSearchSong {
         id: u64,
+        duration: Option<i64>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct LrclibRecord {
+        synced_lyrics: Option<String>,
+        duration: Option<f64>,
     }
 
     fn base64_encode(bytes: &[u8]) -> String {
@@ -285,13 +392,15 @@ mod windows_impl {
     }
 
     fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
-        if bytes.len() >= 8 && bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+        if bytes.len() >= 8 && bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        {
             Some("image/png")
         } else if bytes.len() >= 3 && bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
             Some("image/jpeg")
         } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
             Some("image/webp")
-        } else if bytes.len() >= 6 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
+        } else if bytes.len() >= 6 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"))
+        {
             Some("image/gif")
         } else if bytes.len() >= 2 && bytes.starts_with(b"BM") {
             Some("image/bmp")
@@ -300,15 +409,12 @@ mod windows_impl {
         }
     }
 
-    async fn read_thumbnail_data_url(
-        thumb: &IRandomAccessStreamReference,
-    ) -> Option<String> {
+    async fn read_thumbnail_data_url(thumb: &IRandomAccessStreamReference) -> Option<String> {
         const MAX_COVER_BYTES: usize = 4 * 1024 * 1024;
         let stream = thumb.OpenReadAsync().ok()?.await.ok()?;
         let input = stream.GetInputStreamAt(0).ok()?;
         let reader = DataReader::CreateDataReader(&input).ok()?;
 
-        // Read in chunks until EOF so network-backed WinRT streams never truncate
         let mut bytes: Vec<u8> = Vec::new();
         loop {
             let remaining = MAX_COVER_BYTES.saturating_sub(bytes.len());
@@ -325,7 +431,6 @@ mod windows_impl {
             reader.ReadBytes(&mut bytes[start..]).ok()?;
         }
 
-        // Sniff real image MIME from magic bytes (SMTC often reports "application/octet-stream")
         let mime = detect_image_mime(&bytes)?;
         let b64 = base64_encode(&bytes);
         Some(format!("data:{};base64,{}", mime, b64))
@@ -349,7 +454,12 @@ mod windows_impl {
         out
     }
 
-    fn winhttp_get_bytes(host: &str, path: &str, https: bool) -> Option<Vec<u8>> {
+    fn winhttp_get_bytes(
+        host: &str,
+        path: &str,
+        https: bool,
+        extra_headers: &str,
+    ) -> Option<Vec<u8>> {
         unsafe {
             let agent = to_wide("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Islandex/1.0");
             let session = WinHttpOpen(
@@ -362,6 +472,8 @@ mod windows_impl {
             if session.is_null() {
                 return None;
             }
+
+            let _ = WinHttpSetTimeouts(session, 5_000, 6_000, 8_000, 8_000);
 
             let host_w = to_wide(host);
             let port = if https {
@@ -397,12 +509,14 @@ mod windows_impl {
                 return None;
             }
 
-            let headers = to_wide("Referer: https://music.163.com/\r\n");
-            let _ = WinHttpAddRequestHeaders(
-                request,
-                &headers[..headers.len() - 1],
-                WINHTTP_ADDREQ_FLAG_ADD,
-            );
+            if !extra_headers.is_empty() {
+                let headers = to_wide(extra_headers);
+                let _ = WinHttpAddRequestHeaders(
+                    request,
+                    &headers[..headers.len() - 1],
+                    WINHTTP_ADDREQ_FLAG_ADD,
+                );
+            }
 
             let ok = WinHttpSendRequest(request, None, None, 0, 0, 0).is_ok()
                 && WinHttpReceiveResponse(request, std::ptr::null_mut()).is_ok();
@@ -444,14 +558,164 @@ mod windows_impl {
         }
     }
 
-    fn winhttp_get(host: &str, path: &str) -> Option<String> {
-        let bytes = winhttp_get_bytes(host, path, true)?;
+    fn winhttp_get(host: &str, path: &str, extra_headers: &str) -> Option<String> {
+        let bytes = winhttp_get_bytes(host, path, true, extra_headers)?;
         String::from_utf8(bytes).ok()
+    }
+
+    fn fetch_lrclib_lyrics(title: &str, artist: &str, duration_ms: i64) -> Option<CachedLyrics> {
+        let clean_title = title.trim();
+        let clean_artist = artist.trim();
+        if clean_title.is_empty() {
+            return None;
+        }
+
+        // Exact lookup first
+        let mut get_path = format!(
+            "/api/get?track_name={}&artist_name={}",
+            url_encode_component(clean_title),
+            url_encode_component(clean_artist)
+        );
+        if duration_ms > 1000 {
+            get_path.push_str(&format!("&duration={}", duration_ms / 1000));
+        }
+
+        if let Some(json_text) = winhttp_get("lrclib.net", &get_path, "Accept: application/json\r\n")
+        {
+            if let Ok(rec) = serde_json::from_str::<LrclibRecord>(&json_text) {
+                if let Some(raw) = rec.synced_lyrics {
+                    let lines = parse_lrc(&raw);
+                    if !lines.is_empty() {
+                        return Some(CachedLyrics {
+                            lines,
+                            fallback_duration_ms: rec
+                                .duration
+                                .map(|d| (d * 1000.0) as i64)
+                                .unwrap_or(0),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Fallback fuzzy search on LRCLIB
+        let query = if clean_artist.is_empty() {
+            clean_title.to_string()
+        } else {
+            format!("{clean_title} {clean_artist}")
+        };
+        let search_path = format!("/api/search?q={}", url_encode_component(&query));
+        let json_text = winhttp_get("lrclib.net", &search_path, "Accept: application/json\r\n")?;
+        let records: Vec<LrclibRecord> = serde_json::from_str(&json_text).ok()?;
+        for rec in records {
+            if let Some(raw) = rec.synced_lyrics {
+                let lines = parse_lrc(&raw);
+                if !lines.is_empty() {
+                    return Some(CachedLyrics {
+                        lines,
+                        fallback_duration_ms: rec
+                            .duration
+                            .map(|d| (d * 1000.0) as i64)
+                            .unwrap_or(0),
+                    });
+                }
+            }
+        }
+
+        None
+    }
+
+    fn fetch_ncm_lyrics_by_id(song_id: &str) -> Option<CachedLyrics> {
+        let path = format!("/api/song/lyric?id={}&lv=1&tv=1", song_id);
+        let json_text = winhttp_get(
+            "music.163.com",
+            &path,
+            "Referer: https://music.163.com/\r\nAccept: application/json\r\n",
+        )?;
+        let parsed = serde_json::from_str::<NcmLyricResponse>(&json_text).ok()?;
+        let raw = parsed.lrc?.lyric?;
+        let lines = parse_lrc(&raw);
+        if lines.is_empty() {
+            None
+        } else {
+            Some(CachedLyrics {
+                lines,
+                fallback_duration_ms: 0,
+            })
+        }
+    }
+
+    fn search_ncm_song(title: &str, artist: &str) -> Option<(String, i64)> {
+        let query = if artist.is_empty() {
+            title.trim().to_string()
+        } else {
+            format!("{} {}", title.trim(), artist.trim())
+        };
+        if query.is_empty() {
+            return None;
+        }
+        let path = format!(
+            "/api/search/get/web?s={}&type=1&limit=1",
+            url_encode_component(&query)
+        );
+        let json_text = winhttp_get(
+            "music.163.com",
+            &path,
+            "Referer: https://music.163.com/\r\nAccept: application/json\r\n",
+        )?;
+        let parsed = serde_json::from_str::<NcmSearchResponse>(&json_text).ok()?;
+        let first = parsed.result?.songs?.into_iter().next()?;
+        Some((first.id.to_string(), first.duration.unwrap_or(0)))
+    }
+
+    fn fetch_lyrics_for_track(
+        source: &str,
+        song_id: Option<&str>,
+        title: &str,
+        artist: &str,
+        duration_ms: i64,
+    ) -> CachedLyrics {
+        // 1. Direct exact lookup when InfLink-rs provides NCM-{ID}
+        if let Some(id) = song_id.filter(|s| !s.is_empty()) {
+            if let Some(found) = fetch_ncm_lyrics_by_id(id) {
+                return found;
+            }
+        }
+
+        // 2. For Apple Music / generic players: try LRCLIB first (great international & C-pop synced LRC),
+        //    then fall back to NetEase Cloud Music search
+        if source != "inflink-rs" {
+            if let Some(found) = fetch_lrclib_lyrics(title, artist, duration_ms) {
+                return found;
+            }
+        }
+
+        if let Some((id, ncm_dur)) = search_ncm_song(title, artist) {
+            if let Some(mut found) = fetch_ncm_lyrics_by_id(&id) {
+                if found.fallback_duration_ms <= 0 {
+                    found.fallback_duration_ms = ncm_dur;
+                }
+                return found;
+            }
+        }
+
+        // Last resort for NCM tracks missing lyrics on NetEase: try LRCLIB
+        if source == "inflink-rs" {
+            if let Some(found) = fetch_lrclib_lyrics(title, artist, duration_ms) {
+                return found;
+            }
+        }
+
+        CachedLyrics::default()
     }
 
     fn fetch_ncm_cover_data_url(song_id: &str) -> Option<String> {
         let detail_path = format!("/api/song/detail?id={0}&ids=[{0}]", song_id);
-        let json_text = winhttp_get("music.163.com", &detail_path)?;
+        let json_text = winhttp_get(
+            "music.163.com",
+            &detail_path,
+            "Referer: https://music.163.com/\r\nAccept: application/json\r\n",
+        )?;
         let val: serde_json::Value = serde_json::from_str(&json_text).ok()?;
         let pic_url = val
             .get("songs")?
@@ -471,54 +735,9 @@ mod windows_impl {
         };
         let (host, path) = rest.split_once('/')?;
         let full_path = format!("/{}", path);
-        let bytes = winhttp_get_bytes(host, &full_path, https)?;
+        let bytes = winhttp_get_bytes(host, &full_path, https, "Referer: https://music.163.com/\r\n")?;
         let mime = detect_image_mime(&bytes)?;
         Some(format!("data:{};base64,{}", mime, base64_encode(&bytes)))
-    }
-
-    fn fetch_ncm_lyrics(song_id: Option<&str>, title: &str, artist: &str) -> Vec<LyricLine> {
-        let resolved_id = match song_id {
-            Some(id) if !id.is_empty() => Some(id.to_string()),
-            _ => search_ncm_song_id(title, artist),
-        };
-
-        let Some(id) = resolved_id else {
-            return Vec::new();
-        };
-
-        let path = format!("/api/song/lyric?id={}&lv=1&tv=1", id);
-        let Some(json_text) = winhttp_get("music.163.com", &path) else {
-            return Vec::new();
-        };
-
-        let Ok(parsed) = serde_json::from_str::<NcmLyricResponse>(&json_text) else {
-            return Vec::new();
-        };
-
-        parsed
-            .lrc
-            .and_then(|f| f.lyric)
-            .map(|raw| parse_lrc(&raw))
-            .unwrap_or_default()
-    }
-
-    fn search_ncm_song_id(title: &str, artist: &str) -> Option<String> {
-        let query = if artist.is_empty() {
-            title.trim().to_string()
-        } else {
-            format!("{} {}", title.trim(), artist.trim())
-        };
-        if query.is_empty() {
-            return None;
-        }
-        let path = format!(
-            "/api/search/get/web?s={}&type=1&limit=1",
-            url_encode_component(&query)
-        );
-        let json_text = winhttp_get("music.163.com", &path)?;
-        let parsed = serde_json::from_str::<NcmSearchResponse>(&json_text).ok()?;
-        let id = parsed.result?.songs?.first()?.id;
-        Some(id.to_string())
     }
 
     fn now_filetime_100ns() -> i64 {
@@ -526,8 +745,35 @@ mod windows_impl {
         ((ft.dwHighDateTime as i64) << 32) | (ft.dwLowDateTime as i64)
     }
 
+    fn classify_source(app_id: &str, has_inflink_id: bool) -> &'static str {
+        if has_inflink_id {
+            "inflink-rs"
+        } else if app_id.contains("applemusic")
+            || app_id.contains("appleinc.applemusic")
+            || app_id.contains("itunes")
+            || app_id.contains("cider")
+        {
+            "apple-music"
+        } else if app_id.contains("cloudmusic") || app_id.contains("netease") {
+            "ncm"
+        } else {
+            "smtc"
+        }
+    }
+
+    fn source_matches_preference(source: &str, pref: &str) -> bool {
+        match pref {
+            "ncm" => source == "inflink-rs" || source == "ncm",
+            "apple_music" => source == "apple-music",
+            "all" => true,
+            // Default "auto": support both NetEase Cloud Music (InfLink-rs / native) and Apple Music
+            _ => source == "inflink-rs" || source == "ncm" || source == "apple-music",
+        }
+    }
+
     async fn read_session_snapshot(
         session: &GlobalSystemMediaTransportControlsSession,
+        source_pref: &str,
     ) -> Option<MediaSnapshot> {
         let playback_info = session.GetPlaybackInfo().ok()?;
         let status = playback_info.PlaybackStatus().ok()?;
@@ -536,11 +782,10 @@ mod windows_impl {
 
         let props = session.TryGetMediaPropertiesAsync().ok()?.await.ok()?;
         let title = props.Title().map(|s| s.to_string()).unwrap_or_default();
-        let artist = props.Artist().map(|s| s.to_string()).unwrap_or_default();
-        let album = props.AlbumTitle().map(|s| s.to_string()).unwrap_or_default();
+        let raw_artist = props.Artist().map(|s| s.to_string()).unwrap_or_default();
+        let raw_album = props.AlbumTitle().map(|s| s.to_string()).unwrap_or_default();
         let thumbnail = props.Thumbnail().ok();
 
-        // InfLink-rs embeds the exact NetEase Cloud Music song ID as "NCM-{ID}" in SMTC Genres
         let mut song_id: Option<String> = None;
         if let Ok(genres) = props.Genres() {
             if let Ok(count) = genres.Size() {
@@ -568,14 +813,16 @@ mod windows_impl {
             .map(|s| s.to_string().to_lowercase())
             .unwrap_or_default();
 
-        let is_inflink = song_id.is_some();
-        let is_ncm_app = app_id.contains("cloudmusic") || app_id.contains("netease");
-        if !is_inflink && !is_ncm_app {
+        let source = classify_source(&app_id, song_id.is_some());
+        if !source_matches_preference(source, source_pref) {
             return None;
         }
 
+        let (artist, album) = normalize_artist_album(source, raw_artist, raw_album);
+
         let mut position_ms: i64 = 0;
         let mut duration_ms: i64 = 0;
+        let mut has_timeline = false;
         if let Ok(timeline) = session.GetTimelineProperties() {
             let base_ms = timeline
                 .Position()
@@ -590,8 +837,12 @@ mod windows_impl {
                 .map(|t| t.UniversalTime)
                 .unwrap_or(0);
 
+            if duration_ms > 0 || base_ms > 0 {
+                has_timeline = true;
+            }
+
             position_ms = base_ms;
-            if is_playing && updated_ticks > 0 {
+            if is_playing && has_timeline && updated_ticks > 0 {
                 let now_ticks = now_filetime_100ns();
                 if now_ticks > updated_ticks {
                     let elapsed_ms = ((now_ticks - updated_ticks) / 10_000).clamp(0, 15_000);
@@ -611,18 +862,24 @@ mod windows_impl {
             song_id,
             position_ms: position_ms.max(0),
             duration_ms: duration_ms.max(0),
-            source: if is_inflink {
-                "inflink-rs".to_string()
-            } else {
-                "smtc".to_string()
-            },
+            has_timeline,
+            source: source.to_string(),
+            app_id,
             thumbnail,
         })
     }
 
-    async fn find_best_ncm_session(
+    async fn find_best_media_session(
         manager: &GlobalSystemMediaTransportControlsSessionManager,
+        source_pref: &str,
     ) -> Option<(GlobalSystemMediaTransportControlsSession, MediaSnapshot)> {
+        let current_app_id = manager
+            .GetCurrentSession()
+            .ok()
+            .and_then(|s| s.SourceAppUserModelId().ok())
+            .map(|s| s.to_string().to_lowercase())
+            .unwrap_or_default();
+
         let session_list: Vec<GlobalSystemMediaTransportControlsSession> = {
             let sessions = manager.GetSessions().ok()?;
             let count = sessions.Size().ok()?;
@@ -633,16 +890,20 @@ mod windows_impl {
 
         let mut best: Option<(u8, GlobalSystemMediaTransportControlsSession, MediaSnapshot)> = None;
         for session in session_list {
-            let Some(snap) = read_session_snapshot(&session).await else {
+            let Some(snap) = read_session_snapshot(&session, source_pref).await else {
                 continue;
             };
 
-            let score = match (snap.source == "inflink-rs", snap.is_playing) {
-                (true, true) => 4,
-                (false, true) => 3,
-                (true, false) => 2,
-                (false, false) => 1,
+            let is_current = !current_app_id.is_empty() && snap.app_id == current_app_id;
+            let base: u8 = match snap.source.as_str() {
+                "inflink-rs" => 8,
+                "apple-music" => 8,
+                "ncm" => 6,
+                _ => 4,
             };
+            let play_bonus: u8 = if snap.is_playing { 100 } else { 0 };
+            let current_bonus: u8 = if is_current { 2 } else { 0 };
+            let score = play_bonus + base + current_bonus;
 
             if best
                 .as_ref()
@@ -655,13 +916,14 @@ mod windows_impl {
         best.map(|(_, session, snap)| (session, snap))
     }
 
-    pub fn execute_control(action: &str) -> Result<(), String> {
+    pub fn execute_control(action: &str, source_pref: &str) -> Result<(), String> {
         let action_owned = action.to_string();
+        let pref_owned = source_pref.to_string();
         std::thread::spawn(move || {
             let _ = tauri::async_runtime::block_on(async move {
                 let req = GlobalSystemMediaTransportControlsSessionManager::RequestAsync().ok()?;
                 let mgr = req.await.ok()?;
-                let (session, _) = find_best_ncm_session(&mgr).await?;
+                let (session, _) = find_best_media_session(&mgr, &pref_owned).await?;
                 match action_owned.as_str() {
                     "toggle" => {
                         if let Ok(op) = session.TryTogglePlayPauseAsync() {
@@ -696,13 +958,14 @@ mod windows_impl {
         Ok(())
     }
 
-    pub fn execute_seek(position_ms: i64) -> Result<(), String> {
+    pub fn execute_seek(position_ms: i64, source_pref: &str) -> Result<(), String> {
         let clamped_ticks = position_ms.max(0).saturating_mul(10_000);
+        let pref_owned = source_pref.to_string();
         std::thread::spawn(move || {
             let _ = tauri::async_runtime::block_on(async move {
                 let req = GlobalSystemMediaTransportControlsSessionManager::RequestAsync().ok()?;
                 let mgr = req.await.ok()?;
-                let (session, _) = find_best_ncm_session(&mgr).await?;
+                let (session, _) = find_best_media_session(&mgr, &pref_owned).await?;
                 if let Ok(op) = session.TryChangePlaybackPositionAsync(clamped_ticks) {
                     let _ = op.await;
                 }
@@ -716,14 +979,16 @@ mod windows_impl {
         app: AppHandle,
         shared_payload: Arc<Mutex<LyricPayload>>,
         shared_cover: Arc<Mutex<CoverPayload>>,
+        settings: Arc<Mutex<AppSettings>>,
     ) {
         std::thread::spawn(move || {
-            let lyric_cache: Arc<Mutex<HashMap<String, Vec<LyricLine>>>> =
+            let lyric_cache: Arc<Mutex<HashMap<String, CachedLyrics>>> =
                 Arc::new(Mutex::new(HashMap::new()));
             let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
             let mut cover_cache: HashMap<String, Option<String>> = HashMap::new();
             let mut last_payload = LyricPayload::default();
             let mut last_cover_key = String::new();
+            let mut local_clock = LocalTrackClock::default();
 
             let mut manager: Option<GlobalSystemMediaTransportControlsSessionManager> = None;
 
@@ -738,14 +1003,26 @@ mod windows_impl {
                     }
                 }
 
+                let source_pref = settings
+                    .lock()
+                    .map(|g| g.music_source.clone())
+                    .unwrap_or_else(|_| "auto".to_string());
+
                 let payload = if let Some(ref mgr) = manager {
                     if let Some((_, snap)) =
-                        tauri::async_runtime::block_on(find_best_ncm_session(mgr))
+                        tauri::async_runtime::block_on(find_best_media_session(mgr, &source_pref))
                     {
-                        let song_key = snap
-                            .song_id
-                            .clone()
-                            .unwrap_or_else(|| format!("{}|{}", snap.title, snap.artist));
+                        let song_key = match snap.song_id {
+                            Some(ref id) => format!("ncm:{id}"),
+                            None => format!("{}:{}|{}", snap.source, snap.title, snap.artist),
+                        };
+
+                        let effective_pos_ms = local_clock.update(
+                            &song_key,
+                            snap.is_playing,
+                            snap.position_ms,
+                            snap.has_timeline,
+                        );
 
                         // Decode & cache album art once per song (SMTC thumbnail first, NCM API fallback)
                         if !song_key.is_empty() && song_key != last_cover_key {
@@ -784,12 +1061,15 @@ mod windows_impl {
                             }
                         }
 
-                        let cached_lines = lyric_cache
+                        let cached_entry = lyric_cache
                             .lock()
                             .ok()
                             .and_then(|map| map.get(&song_key).cloned());
 
-                        if cached_lines.is_none() && !song_key.is_empty() && snap.is_playing {
+                        if cached_entry.is_none()
+                            && !snap.title.is_empty()
+                            && snap.is_playing
+                        {
                             let should_fetch = in_flight
                                 .lock()
                                 .map(|mut set| set.insert(song_key.clone()))
@@ -799,15 +1079,22 @@ mod windows_impl {
                                 let cache_bg = Arc::clone(&lyric_cache);
                                 let in_flight_bg = Arc::clone(&in_flight);
                                 let key_bg = song_key.clone();
+                                let source_bg = snap.source.clone();
                                 let id_bg = snap.song_id.clone();
                                 let title_bg = snap.title.clone();
                                 let artist_bg = snap.artist.clone();
+                                let dur_bg = snap.duration_ms;
 
                                 std::thread::spawn(move || {
-                                    let lines =
-                                        fetch_ncm_lyrics(id_bg.as_deref(), &title_bg, &artist_bg);
+                                    let result = fetch_lyrics_for_track(
+                                        &source_bg,
+                                        id_bg.as_deref(),
+                                        &title_bg,
+                                        &artist_bg,
+                                        dur_bg,
+                                    );
                                     if let Ok(mut map) = cache_bg.lock() {
-                                        map.insert(key_bg.clone(), lines);
+                                        map.insert(key_bg.clone(), result);
                                     }
                                     if let Ok(mut set) = in_flight_bg.lock() {
                                         set.remove(&key_bg);
@@ -816,10 +1103,35 @@ mod windows_impl {
                             }
                         }
 
+                        let effective_duration_ms = if snap.duration_ms > 0 {
+                            snap.duration_ms
+                        } else {
+                            cached_entry
+                                .as_ref()
+                                .map(|c| c.fallback_duration_ms)
+                                .unwrap_or(0)
+                        };
+
+                        let clamped_pos_ms = if effective_duration_ms > 0 {
+                            effective_pos_ms.min(effective_duration_ms)
+                        } else {
+                            effective_pos_ms
+                        };
+
+                        // Apple Music Windows SMTC typically lags audio output by ~1000ms;
+                        // apply a larger anticipation lead while keeping InfLink-rs at +120ms.
+                        let lyric_lead_ms = if snap.source == "apple-music" {
+                            1800
+                        } else if snap.source == "smtc" {
+                            1000
+                        } else { // inflink-rs
+                            120
+                        };
+
                         let active_line = if snap.is_playing {
-                            cached_lines
-                                .as_deref()
-                                .and_then(|lines| find_active_line(lines, snap.position_ms))
+                            cached_entry
+                                .as_ref()
+                                .and_then(|c| find_active_line(&c.lines, clamped_pos_ms, lyric_lead_ms))
                                 .map(|s| s.to_string())
                                 .unwrap_or_else(|| {
                                     if snap.title.is_empty() {
@@ -841,11 +1153,12 @@ mod windows_impl {
                             line: active_line,
                             song_id: snap.song_id,
                             source: snap.source,
-                            position_ms: snap.position_ms,
-                            duration_ms: snap.duration_ms,
+                            position_ms: clamped_pos_ms,
+                            duration_ms: effective_duration_ms,
                             cover_key: song_key,
                         }
                     } else {
+                        local_clock.reset();
                         LyricPayload::default()
                     }
                 } else {
@@ -870,10 +1183,11 @@ pub fn spawn_lyric_watcher(
     app: AppHandle,
     payload: Arc<Mutex<LyricPayload>>,
     cover: Arc<Mutex<CoverPayload>>,
+    settings: Arc<Mutex<AppSettings>>,
 ) {
     #[cfg(target_os = "windows")]
-    windows_impl::spawn(app, payload, cover);
+    windows_impl::spawn(app, payload, cover, settings);
 
     #[cfg(not(target_os = "windows"))]
-    let _ = (app, payload, cover);
+    let _ = (app, payload, cover, settings);
 }

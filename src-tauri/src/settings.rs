@@ -18,6 +18,8 @@ pub struct AppSettings {
     pub target_language: String,
     /// Seconds to wait for user confirmation in the collapsed capsule (default: 10s).
     pub prompt_timeout_sec: u64,
+    /// Music media source filter: `"auto"` (NCM + Apple Music), `"ncm"`, `"apple_music"`, or `"all"`.
+    pub music_source: String,
 }
 
 impl Default for AppSettings {
@@ -30,6 +32,7 @@ impl Default for AppSettings {
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
             target_language: "auto".to_string(),
             prompt_timeout_sec: 10,
+            music_source: "auto".to_string(),
         }
     }
 }
@@ -87,6 +90,12 @@ pub fn save_settings(
     if normalized.prompt_timeout_sec == 0 {
         normalized.prompt_timeout_sec = 10;
     }
+    normalized.music_source = match normalized.music_source.trim() {
+        "ncm" => "ncm".to_string(),
+        "apple_music" => "apple_music".to_string(),
+        "all" => "all".to_string(),
+        _ => "auto".to_string(),
+    };
 
     apply_auto_start(normalized.auto_start)?;
     persist_settings(&app, &normalized)?;

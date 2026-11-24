@@ -12,6 +12,7 @@ interface AppSettings {
   systemPrompt: string;
   targetLanguage: string;
   promptTimeoutSec: number;
+  musicSource: string;
 }
 
 interface UpdateCheckResult {
@@ -36,7 +37,15 @@ const DEFAULT_SETTINGS: AppSettings = {
   systemPrompt: DEFAULT_SYSTEM_PROMPT,
   targetLanguage: "auto",
   promptTimeoutSec: 10,
+  musicSource: "auto",
 };
+
+const MUSIC_SOURCE_OPTIONS = [
+  { value: "auto", label: "自动（网易云音乐 + Apple Music）" },
+  { value: "ncm", label: "仅网易云音乐（InfLink-rs）" },
+  { value: "apple_music", label: "仅 Apple Music" },
+  { value: "all", label: "所有系统媒体（含 Spotify / 浏览器等）" },
+];
 
 const LANGUAGE_OPTIONS = [
   { value: "简体中文", label: "简体中文" },
@@ -225,6 +234,33 @@ export function SettingsPanel() {
                   >
                     <span className="settings-switch-thumb" />
                   </button>
+                </div>
+
+                <div className="settings-divider" />
+
+                <div className="settings-row">
+                  <div className="settings-row-info">
+                    <span className="settings-row-title">音乐来源</span>
+                    <span className="settings-row-desc">
+                      选择灵动岛接管的播放器，自动模式同时支持网易云音乐与 Apple Music
+                    </span>
+                  </div>
+                  <select
+                    className="settings-input settings-select settings-select-inline"
+                    value={settings.musicSource}
+                    onChange={(e) => {
+                      const next = { ...settings, musicSource: e.target.value };
+                      setSettings(next);
+                      void persist(next, "音乐来源已更新");
+                    }}
+                    disabled={saving}
+                  >
+                    {MUSIC_SOURCE_OPTIONS.map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
                 </div>
 
                 <div className="settings-divider" />

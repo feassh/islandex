@@ -85,6 +85,12 @@ export function MusicPlayerPanel({
 
   const subtitle = [media.artist, media.album].filter(Boolean).join(" · ");
   const hasRealLyric = Boolean(media.line) && media.line !== `♪ ${media.title}`;
+  const defaultTitle =
+    media.source === "apple-music"
+      ? "Apple Music"
+      : media.source === "inflink-rs" || media.source === "ncm"
+        ? "网易云音乐"
+        : "正在播放";
 
   return (
     <div className="island-music-panel">
@@ -109,8 +115,8 @@ export function MusicPlayerPanel({
         </div>
 
         <div className="island-music-meta">
-          <p className="island-music-title">{media.title || "网易云音乐"}</p>
-          <p className="island-music-subtitle">{subtitle || "正在播放"}</p>
+          <p className="island-music-title">{media.title || defaultTitle}</p>
+          <p className="island-music-subtitle">{subtitle || defaultTitle}</p>
           {hasRealLyric ? <p className="island-music-lyric-sub">{media.line}</p> : null}
         </div>
 
