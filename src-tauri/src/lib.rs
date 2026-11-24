@@ -2,6 +2,7 @@ mod clipboard;
 mod lyrics;
 mod settings;
 mod translate;
+mod updater;
 
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
@@ -682,7 +683,10 @@ pub fn run() {
             settings::get_system_language,
             clipboard::copy_to_clipboard,
             translate::start_translation,
-            translate::cancel_translation
+            translate::cancel_translation,
+            updater::get_app_version,
+            updater::check_for_update,
+            updater::open_external_url
         ])
         .setup(move |app| {
             let loaded_settings = settings::load_settings_from_disk(app.handle());

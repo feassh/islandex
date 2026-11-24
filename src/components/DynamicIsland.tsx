@@ -448,6 +448,15 @@ export function DynamicIsland({
     }
   }, [phase, translatedText]);
 
+  // Disable default WebView context menu ("Inspect" / DevTools) on the Dynamic Island window
+  useEffect(() => {
+    const preventContextMenu = (e: MouseEvent) => {
+      e.preventDefault();
+    };
+    window.addEventListener("contextmenu", preventContextMenu, true);
+    return () => window.removeEventListener("contextmenu", preventContextMenu, true);
+  }, []);
+
   // Paint initial state on mount and cancel RAF ONLY on component unmount
   useEffect(() => {
     if (physicsRef.current) {
@@ -778,7 +787,7 @@ export function DynamicIsland({
   );
 
   return (
-    <div className="island-stage">
+    <div className="island-stage" onContextMenu={(e) => e.preventDefault()}>
       <KeyRadiator ref={keyRadiatorRef} />
       <div
         ref={islandRef}
