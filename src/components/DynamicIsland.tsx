@@ -14,6 +14,7 @@ import {
   MUSIC_EXPANDED_METRICS,
   TRANSLATING_METRICS,
   computeIslandMetrics,
+  computePeekMetrics,
 } from "../physics/spring";
 import { BloubAvatar, BloubAvatarHandle, GazeTarget } from "./BloubAvatar";
 import { KeyRadiator, KeyRadiatorHandle } from "./KeyRadiator";
@@ -51,6 +52,8 @@ interface TranslateErrorPayload {
 }
 
 type IslandPhase = "normal" | "prompt" | "translating";
+type HoverStage = "idle" | "peek" | "expanded";
+const BROWSER_HOVER_DELAY_MS = 360;
 
 const EMPTY_MEDIA: MediaInfo = {
   hasMedia: false,
@@ -128,6 +131,8 @@ export function DynamicIsland({
   const rafRef = useRef<number | null>(null);
   const lastTimeRef = useRef<number | null>(null);
   const hoveredRef = useRef(false);
+  const hoverStageRef = useRef<HoverStage>("idle");
+  const domHoverTimerRef = useRef<number | null>(null);
   const phaseRef = useRef<IslandPhase>("normal");
   const musicExpandedRef = useRef(false);
   const mediaRef = useRef<MediaInfo>(EMPTY_MEDIA);
@@ -244,23 +249,35 @@ export function DynamicIsland({
   }, []);
 
   const updateSpringTarget = useCallback(
-    (expanded: boolean) => {
+    (expanded: boolean, stageOverride?: HoverStage) => {
       const physics = physicsRef.current;
       if (!physics) return;
 
       const hostWidth = window.innerWidth || ISLAND_HOST_WIDTH;
+      const maxWidth = hostWidth - 32;
       const { extraWidth, activeSlots, rightOnly } = contentMeasureRef.current;
+      const stage = stageOverride ?? hoverStageRef.current;
 
-      const metrics =
-        phaseRef.current === "translating"
-          ? TRANSLATING_METRICS
-          : expanded
-            ? musicExpandedRef.current
-              ? MUSIC_EXPANDED_METRICS
-              : computeIslandMetrics(true, 0, 0, hostWidth - 32)
-            : computeIslandMetrics(false, extraWidth, activeSlots, hostWidth - 32, rightOnly);
+      let metrics;
+      let useExpandSpring = expanded || phaseRef.current === "translating";
 
-      physics.setTarget(metrics, expanded || phaseRef.current === "translating");
+      if (phaseRef.current === "translating") {
+        metrics = TRANSLATING_METRICS;
+      } else if (expanded) {
+        metrics = musicExpandedRef.current
+          ? MUSIC_EXPANDED_METRICS
+          : computeIslandMetrics(true, 0, 0, maxWidth);
+      } else {
+        const collapsed = computeIslandMetrics(false, extraWidth, activeSlots, maxWidth, rightOnly);
+        if (phaseRef.current === "normal" && stage === "peek") {
+          metrics = computePeekMetrics(collapsed, maxWidth);
+          useExpandSpring = true;
+        } else {
+          metrics = collapsed;
+        }
+      }
+
+      physics.setTarget(metrics, useExpandSpring);
       ensureAnimating();
     },
     [ensureAnimating],
@@ -271,6 +288,11 @@ export function DynamicIsland({
       phaseRef.current = next;
       setPhaseState(next);
 
+      if (domHoverTimerRef.current !== null) {
+        window.clearTimeout(domHoverTimerRef.current);
+        domHoverTimerRef.current = null;
+      }
+
       if (isTauriRuntime()) {
         invoke("set_island_mode", { mode: next }).catch(() => {});
       }
@@ -279,24 +301,29 @@ export function DynamicIsland({
         musicExpandedRef.current = false;
         setMusicExpandedState(false);
         hoveredRef.current = true;
+        hoverStageRef.current = "expanded";
         setIsExpandedState(true);
-        updateSpringTarget(true);
+        updateSpringTarget(true, "expanded");
       } else {
         musicExpandedRef.current = false;
         setMusicExpandedState(false);
         hoveredRef.current = false;
+        hoverStageRef.current = "idle";
         setIsExpandedState(false);
-        updateSpringTarget(false);
+        updateSpringTarget(false, "idle");
       }
       syncHitbox();
     },
     [syncHitbox, updateSpringTarget],
   );
 
-  const setExpanded = useCallback(
-    (expanded: boolean) => {
+  const setHoverStage = useCallback(
+    (stage: HoverStage) => {
       if (phaseRef.current !== "normal") return;
-      if (hoveredRef.current === expanded) return;
+      if (hoverStageRef.current === stage) return;
+      hoverStageRef.current = stage;
+
+      const expanded = stage === "expanded";
       hoveredRef.current = expanded;
 
       // Enter music player mode when hovering while music is playing; keep it active until mouse leaves
@@ -305,11 +332,32 @@ export function DynamicIsland({
       setMusicExpandedState(nextMusicExpanded);
 
       setIsExpandedState(expanded);
-      updateSpringTarget(expanded);
+      updateSpringTarget(expanded, stage);
       syncHitbox();
     },
     [syncHitbox, updateSpringTarget],
   );
+
+  const handleDomPointerEnter = useCallback(() => {
+    if (!useDomPointerRef.current || phaseRef.current !== "normal") return;
+    if (domHoverTimerRef.current !== null) {
+      window.clearTimeout(domHoverTimerRef.current);
+    }
+    setHoverStage("peek");
+    domHoverTimerRef.current = window.setTimeout(() => {
+      domHoverTimerRef.current = null;
+      setHoverStage("expanded");
+    }, BROWSER_HOVER_DELAY_MS);
+  }, [setHoverStage]);
+
+  const handleDomPointerLeave = useCallback(() => {
+    if (!useDomPointerRef.current || phaseRef.current !== "normal") return;
+    if (domHoverTimerRef.current !== null) {
+      window.clearTimeout(domHoverTimerRef.current);
+      domHoverTimerRef.current = null;
+    }
+    setHoverStage("idle");
+  }, [setHoverStage]);
 
   const triggerClickPulse = useCallback(() => {
     if (phaseRef.current !== "normal" || hoveredRef.current) return;
@@ -632,9 +680,9 @@ export function DynamicIsland({
       })
       .catch(() => {});
 
-    listen<boolean>("island://hover", (event) => {
-      if (active) {
-        setExpanded(Boolean(event.payload));
+    listen<HoverStage>("island://hover-stage", (event) => {
+      if (active && event.payload) {
+        setHoverStage(event.payload);
       }
     }).then((fn) => {
       if (active) unlistenHover = fn;
@@ -750,6 +798,10 @@ export function DynamicIsland({
 
     return () => {
       active = false;
+      if (domHoverTimerRef.current !== null) {
+        window.clearTimeout(domHoverTimerRef.current);
+        domHoverTimerRef.current = null;
+      }
       window.removeEventListener("resize", syncHitbox);
       unlistenHover?.();
       unlistenCursor?.();
@@ -764,7 +816,7 @@ export function DynamicIsland({
       unlistenErr?.();
       unlistenFallback?.();
     };
-  }, [emitKeyParticle, setExpanded, setPhase, syncHitbox, triggerClickPulse]);
+  }, [emitKeyParticle, setHoverStage, setPhase, syncHitbox, triggerClickPulse]);
 
   const avatarElement = showThinkingSvg ? (
     <img
@@ -792,12 +844,8 @@ export function DynamicIsland({
       <div
         ref={islandRef}
         className={`island-shell ${phase === "translating" || showMusicPanel ? "island-shell-panel" : ""}`}
-        onPointerEnter={() => {
-          if (useDomPointerRef.current) setExpanded(true);
-        }}
-        onPointerLeave={() => {
-          if (useDomPointerRef.current) setExpanded(false);
-        }}
+        onPointerEnter={handleDomPointerEnter}
+        onPointerLeave={handleDomPointerLeave}
       >
         {phase === "translating" ? (
           <div className="island-translate-panel">

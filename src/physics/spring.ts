@@ -123,6 +123,25 @@ export const MUSIC_EXPANDED_METRICS: IslandMetrics = {
   avatarSize: 64,
 };
 
+/**
+ * Slightly enlarged "hover peek" dimensions shown immediately when the mouse enters
+ * the collapsed island while waiting for the hover dwell delay before full expansion.
+ */
+export function computePeekMetrics(
+  collapsed: IslandMetrics,
+  maxWidth: number = ISLAND_HOST_WIDTH - 32,
+): IslandMetrics {
+  const isCircle = Math.abs(collapsed.width - collapsed.height) < 1;
+  const height = collapsed.height + 6; // 32 -> 38
+  const width = isCircle ? height : Math.min(collapsed.width + 8, maxWidth);
+  return {
+    width,
+    height,
+    radius: height / 2,
+    avatarSize: collapsed.avatarSize + 5, // 30 -> 35
+  };
+}
+
 export function computeIslandMetrics(
   expanded: boolean,
   extraWidth: number,

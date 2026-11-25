@@ -1,12 +1,13 @@
 mod clipboard;
 mod lyrics;
 mod settings;
+mod single_instance;
 mod translate;
 mod updater;
 
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton as TrayMouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{
@@ -503,19 +504,30 @@ fn position_top_center(window: &WebviewWindow) {
     }
 }
 
+const HOVER_EXPAND_DELAY_MS: u64 = 360;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoverStage {
+    Idle,
+    Peek(Instant),
+    Expanded,
+}
+
 /// Polls global cursor coordinates, mouse buttons, and keyboard presses while honoring IslandMode:
-/// - Normal: hover on collapsed expands island; transparent space stays click-through.
+/// - Normal: cursor entering collapsed triggers immediate "peek" (slight swell); dwelling >= 360ms
+///   promotes to "expanded", leaving before or after immediately returns to "idle".
 /// - Prompt: hover on collapsed makes prompt buttons clickable WITHOUT expanding away the prompt.
 /// - Translating: keeps island expanded and clickable when hovered, click-through outside.
 fn spawn_cursor_tracker(
     window: WebviewWindow,
     hitbox: Arc<Mutex<IslandHitbox>>,
     mode_state: Arc<Mutex<IslandMode>>,
+    settings_state: Arc<Mutex<settings::AppSettings>>,
 ) {
     let _ = window.set_ignore_cursor_events(true);
 
     std::thread::spawn(move || {
-        let mut is_hovered = false;
+        let mut hover_stage = HoverStage::Idle;
         let mut ignoring_cursor = true;
         let mut consecutive_errors: u32 = 0;
         let mut last_cursor: Option<(f64, f64)> = None;
@@ -531,11 +543,13 @@ fn spawn_cursor_tracker(
                 .map(|g| *g)
                 .unwrap_or(IslandMode::Normal);
 
+            let is_expanded = matches!(hover_stage, HoverStage::Expanded);
+
             let (is_left_down, left_pressed_since_last) = poll_mouse_button(MouseButton::Left);
             let left_clicked = (!was_left_down) && (is_left_down || left_pressed_since_last);
             was_left_down = is_left_down;
 
-            if left_clicked && mode == IslandMode::Normal && !is_hovered {
+            if left_clicked && mode == IslandMode::Normal && !is_expanded {
                 let _ = window.emit("island://pulse", ());
             }
 
@@ -547,8 +561,13 @@ fn spawn_cursor_tracker(
                 let _ = window.emit("island://blink", ());
             }
 
+            let typing_enabled = settings_state
+                .lock()
+                .map(|g| g.enable_typing_effect)
+                .unwrap_or(true);
+
             let pressed_keys = keyboard.poll_pressed();
-            if mode == IslandMode::Normal && !is_hovered {
+            if typing_enabled && mode == IslandMode::Normal && !is_expanded {
                 for label in pressed_keys {
                     let _ = window.emit(
                         "island://key",
@@ -589,30 +608,59 @@ fn spawn_cursor_tracker(
                 Err(_) => continue,
             };
 
-            let mut hover_changed = false;
+            let mut stage_changed = false;
             let should_ignore_cursor = match mode {
                 IslandMode::Normal => {
-                    let next_hovered = if is_hovered {
-                        bounds.expanded.contains(local_x, local_y, 8.0)
-                    } else {
-                        bounds.collapsed.contains(local_x, local_y, 4.0)
+                    let next_stage = match hover_stage {
+                        HoverStage::Idle => {
+                            if bounds.collapsed.contains(local_x, local_y, 4.0) {
+                                HoverStage::Peek(Instant::now())
+                            } else {
+                                HoverStage::Idle
+                            }
+                        }
+                        HoverStage::Peek(entered_at) => {
+                            if !bounds.collapsed.contains(local_x, local_y, 8.0) {
+                                HoverStage::Idle
+                            } else if entered_at.elapsed()
+                                >= Duration::from_millis(HOVER_EXPAND_DELAY_MS)
+                            {
+                                HoverStage::Expanded
+                            } else {
+                                HoverStage::Peek(entered_at)
+                            }
+                        }
+                        HoverStage::Expanded => {
+                            if bounds.expanded.contains(local_x, local_y, 8.0) {
+                                HoverStage::Expanded
+                            } else {
+                                HoverStage::Idle
+                            }
+                        }
                     };
-                    if next_hovered != is_hovered {
-                        is_hovered = next_hovered;
-                        hover_changed = true;
-                        let _ = window.emit("island://hover", is_hovered);
+
+                    if std::mem::discriminant(&next_stage) != std::mem::discriminant(&hover_stage) {
+                        hover_stage = next_stage;
+                        stage_changed = true;
+                        let stage_str = match hover_stage {
+                            HoverStage::Idle => "idle",
+                            HoverStage::Peek(_) => "peek",
+                            HoverStage::Expanded => "expanded",
+                        };
+                        let _ = window.emit("island://hover-stage", stage_str);
+                    } else {
+                        hover_stage = next_stage;
                     }
-                    !is_hovered
+
+                    !matches!(hover_stage, HoverStage::Expanded)
                 }
                 IslandMode::Prompt => {
-                    if is_hovered {
-                        is_hovered = false;
-                    }
+                    hover_stage = HoverStage::Idle;
                     let over_prompt = bounds.collapsed.contains(local_x, local_y, 6.0);
                     !over_prompt
                 }
                 IslandMode::Translating => {
-                    is_hovered = true;
+                    hover_stage = HoverStage::Expanded;
                     let over_card = bounds.expanded.contains(local_x, local_y, 6.0);
                     !over_card
                 }
@@ -623,7 +671,9 @@ fn spawn_cursor_tracker(
                 let _ = window.set_ignore_cursor_events(ignoring_cursor);
             }
 
-            let active_rect = if is_hovered || mode == IslandMode::Translating {
+            let active_rect = if matches!(hover_stage, HoverStage::Expanded)
+                || mode == IslandMode::Translating
+            {
                 bounds.expanded
             } else {
                 bounds.collapsed
@@ -639,7 +689,7 @@ fn spawn_cursor_tracker(
                 None => true,
             };
 
-            if cursor_moved || hover_changed {
+            if cursor_moved || stage_changed {
                 last_cursor = Some((dx, dy));
                 let _ = window.emit("island://cursor", CursorOffset { dx, dy });
             }
@@ -649,6 +699,11 @@ fn spawn_cursor_tracker(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Enforce single running instance before creating any windows, tray icons, or background threads
+    let Some(_single_instance_guard) = single_instance::acquire() else {
+        return;
+    };
+
     let hitbox = Arc::new(Mutex::new(IslandHitbox::default()));
     let tracker_hitbox = Arc::clone(&hitbox);
     let mode_state = Arc::new(Mutex::new(IslandMode::Normal));
@@ -685,7 +740,9 @@ pub fn run() {
             translate::start_translation,
             translate::cancel_translation,
             updater::get_app_version,
+            updater::is_setup_installed,
             updater::check_for_update,
+            updater::download_and_install_update,
             updater::open_external_url
         ])
         .setup(move |app| {
@@ -697,7 +754,12 @@ pub fn run() {
 
             if let Some(window) = app.get_webview_window("main") {
                 position_top_center(&window);
-                spawn_cursor_tracker(window, tracker_hitbox, tracker_mode);
+                spawn_cursor_tracker(
+                    window,
+                    tracker_hitbox,
+                    tracker_mode,
+                    Arc::clone(&settings_shared),
+                );
             }
             lyrics::spawn_lyric_watcher(
                 app.handle().clone(),

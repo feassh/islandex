@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { BLOUB_CERCLE_SVGS } from "../assets/bloubCercle";
 import "./SettingsPanel.css";
@@ -13,15 +14,28 @@ interface AppSettings {
   targetLanguage: string;
   promptTimeoutSec: number;
   musicSource: string;
+  enableTypingEffect: boolean;
 }
 
 interface UpdateCheckResult {
   currentVersion: string;
   latestVersion: string | null;
   hasUpdate: boolean;
+  isInstalled: boolean;
+  setupAssetUrl: string | null;
+  setupAssetName: string | null;
+  setupAssetSize: number | null;
   releaseUrl: string;
   releaseNotes: string;
   statusMessage: string;
+}
+
+interface UpdateProgressPayload {
+  stage: "downloading" | "installing" | "error";
+  downloaded: number;
+  total: number;
+  percent: number;
+  message: string;
 }
 
 const GITHUB_REPO_URL = "https://github.com/feassh/islandex";
@@ -38,6 +52,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   targetLanguage: "auto",
   promptTimeoutSec: 10,
   musicSource: "auto",
+  enableTypingEffect: true,
 };
 
 const MUSIC_SOURCE_OPTIONS = [
@@ -61,11 +76,19 @@ const LANGUAGE_OPTIONS = [
 
 type SettingsTab = "general" | "translation" | "about";
 
+function formatBytes(bytes: number): string {
+  if (bytes <= 0) return "0 B";
+  const mb = bytes / (1024 * 1024);
+  if (mb >= 1) return `${mb.toFixed(1)} MB`;
+  return `${Math.round(bytes / 1024)} KB`;
+}
+
 export function SettingsPanel() {
   const [activeTab, setActiveTab] = useState<SettingsTab>("general");
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [systemLang, setSystemLang] = useState("简体中文");
   const [appVersion, setAppVersion] = useState("0.1.0");
+  const [isSetupInstalled, setIsSetupInstalled] = useState(false);
   const [showKey, setShowKey] = useState(false);
   const [saving, setSaving] = useState(false);
   const [toast, setToast] = useState<{ type: "ok" | "err"; text: string } | null>(null);
@@ -75,6 +98,7 @@ export function SettingsPanel() {
     null,
   );
   const [updateDialog, setUpdateDialog] = useState<UpdateCheckResult | null>(null);
+  const [updateProgress, setUpdateProgress] = useState<UpdateProgressPayload | null>(null);
 
   useEffect(() => {
     document.body.classList.add("settings-mode");
@@ -82,13 +106,28 @@ export function SettingsPanel() {
       invoke<AppSettings>("get_settings").catch(() => DEFAULT_SETTINGS),
       invoke<string>("get_system_language").catch(() => "简体中文"),
       invoke<string>("get_app_version").catch(() => "0.1.0"),
-    ]).then(([loaded, lang, version]) => {
+      invoke<boolean>("is_setup_installed").catch(() => false),
+    ]).then(([loaded, lang, version, installed]) => {
       setSettings({ ...DEFAULT_SETTINGS, ...loaded });
       setSystemLang(lang || "简体中文");
       setAppVersion(version || "0.1.0");
+      setIsSetupInstalled(Boolean(installed));
+    });
+
+    let unlistenProgress: (() => void) | undefined;
+    let active = true;
+    listen<UpdateProgressPayload>("island://update-progress", (event) => {
+      if (active && event.payload) {
+        setUpdateProgress(event.payload);
+      }
+    }).then((fn) => {
+      if (active) unlistenProgress = fn;
+      else fn();
     });
 
     return () => {
+      active = false;
+      unlistenProgress?.();
       document.body.classList.remove("settings-mode");
     };
   }, []);
@@ -119,6 +158,12 @@ export function SettingsPanel() {
     void persist(next, next.autoStart ? "已开启开机启动" : "已关闭开机启动");
   };
 
+  const handleToggleTypingEffect = () => {
+    const next = { ...settings, enableTypingEffect: !settings.enableTypingEffect };
+    setSettings(next);
+    void persist(next, next.enableTypingEffect ? "已开启打字按键效果" : "已关闭打字按键效果");
+  };
+
   const handleOpenExternal = async (url: string) => {
     try {
       await invoke("open_external_url", { url });
@@ -130,8 +175,10 @@ export function SettingsPanel() {
   const handleCheckUpdate = async () => {
     setCheckingUpdate(true);
     setUpdateStatus(null);
+    setUpdateProgress(null);
     try {
       const result = await invoke<UpdateCheckResult>("check_for_update");
+      setIsSetupInstalled(result.isInstalled);
       if (result.hasUpdate) {
         setUpdateDialog(result);
         setUpdateStatus({ type: "ok", text: result.statusMessage });
@@ -145,6 +192,31 @@ export function SettingsPanel() {
     }
   };
 
+  const handleDownloadAndInstall = async () => {
+    if (!updateDialog?.setupAssetUrl) return;
+    setUpdateProgress({
+      stage: "downloading",
+      downloaded: 0,
+      total: updateDialog.setupAssetSize ?? 0,
+      percent: 0,
+      message: "正在准备下载最新安装包…",
+    });
+    try {
+      await invoke("download_and_install_update", {
+        url: updateDialog.setupAssetUrl,
+        fileName: updateDialog.setupAssetName || "Islandex-setup.exe",
+      });
+    } catch (err) {
+      setUpdateProgress({
+        stage: "error",
+        downloaded: 0,
+        total: 0,
+        percent: 0,
+        message: String(err),
+      });
+    }
+  };
+
   const handleClose = () => {
     void getCurrentWindow().close();
   };
@@ -152,6 +224,10 @@ export function SettingsPanel() {
   const handleMinimize = () => {
     void getCurrentWindow().minimize();
   };
+
+  const canAutoInstall = Boolean(updateDialog?.isInstalled && updateDialog?.setupAssetUrl);
+  const isDownloadingOrInstalling =
+    updateProgress?.stage === "downloading" || updateProgress?.stage === "installing";
 
   return (
     <div className="settings-root">
@@ -213,7 +289,7 @@ export function SettingsPanel() {
             <section className="settings-section">
               <div className="settings-section-head">
                 <h2>通用</h2>
-                <p>控制 Islandex 的系统启动与交互行为</p>
+                <p>控制 Islandex 的系统启动、打字效果与媒体接入行为</p>
               </div>
 
               <div className="settings-card">
@@ -230,6 +306,27 @@ export function SettingsPanel() {
                     aria-checked={settings.autoStart}
                     className={`settings-switch ${settings.autoStart ? "is-on" : ""}`}
                     onClick={handleToggleAutoStart}
+                    disabled={saving}
+                  >
+                    <span className="settings-switch-thumb" />
+                  </button>
+                </div>
+
+                <div className="settings-divider" />
+
+                <div className="settings-row">
+                  <div className="settings-row-info">
+                    <span className="settings-row-title">打字按键辐射效果</span>
+                    <span className="settings-row-desc">
+                      收缩状态下打字时在灵动岛周围随机角度弹出迷你键帽动效
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={settings.enableTypingEffect}
+                    className={`settings-switch ${settings.enableTypingEffect ? "is-on" : ""}`}
+                    onClick={handleToggleTypingEffect}
                     disabled={saving}
                   >
                     <span className="settings-switch-thumb" />
@@ -437,7 +534,9 @@ export function SettingsPanel() {
                     draggable={false}
                   />
                   <h2 className="settings-about-name">Islandex</h2>
-                  <span className="settings-about-version">当前版本 v{appVersion}</span>
+                  <span className="settings-about-version">
+                    v{appVersion} · {isSetupInstalled ? "安装版 (Setup)" : "便携版"}
+                  </span>
                   <p className="settings-about-tagline">
                     跨平台桌面灵动岛 · 实时歌词 · 剪贴板流式翻译
                   </p>
@@ -475,7 +574,9 @@ export function SettingsPanel() {
       {updateDialog ? (
         <div
           className="settings-modal-backdrop"
-          onClick={() => setUpdateDialog(null)}
+          onClick={() => {
+            if (!isDownloadingOrInstalling) setUpdateDialog(null);
+          }}
           role="dialog"
           aria-modal="true"
           aria-label="发现新版本"
@@ -490,25 +591,93 @@ export function SettingsPanel() {
             {updateDialog.releaseNotes ? (
               <div className="settings-modal-notes">{updateDialog.releaseNotes}</div>
             ) : null}
+
+            {updateProgress ? (
+              <div className="settings-update-progress">
+                <div className="settings-update-progress-head">
+                  <span
+                    className={
+                      updateProgress.stage === "error"
+                        ? "settings-update-err-text"
+                        : "settings-update-msg"
+                    }
+                  >
+                    {updateProgress.message}
+                  </span>
+                  {updateProgress.stage === "downloading" && updateProgress.total > 0 ? (
+                    <span className="settings-update-pct">
+                      {updateProgress.percent}% ({formatBytes(updateProgress.downloaded)} /{" "}
+                      {formatBytes(updateProgress.total)})
+                    </span>
+                  ) : null}
+                </div>
+                {updateProgress.stage !== "error" ? (
+                  <div className="settings-update-bar">
+                    <div
+                      className="settings-update-bar-fill"
+                      style={{
+                        width: `${updateProgress.stage === "installing" ? 100 : updateProgress.percent}%`,
+                      }}
+                    />
+                  </div>
+                ) : null}
+              </div>
+            ) : !updateDialog.isInstalled ? (
+              <p className="settings-modal-hint">
+                当前为便携版，在线自动安装仅支持 Setup 安装版，请前往 GitHub 下载最新版本。
+              </p>
+            ) : null}
+
             <div className="settings-modal-actions">
               <button
                 type="button"
                 className="settings-secondary-btn"
-                onClick={() => setUpdateDialog(null)}
+                onClick={() => {
+                  setUpdateDialog(null);
+                  setUpdateProgress(null);
+                }}
+                disabled={isDownloadingOrInstalling}
               >
                 稍后再说
               </button>
-              <button
-                type="button"
-                className="settings-save-btn"
-                onClick={() => {
-                  const targetUrl = updateDialog.releaseUrl || GITHUB_REPO_URL;
-                  setUpdateDialog(null);
-                  void handleOpenExternal(targetUrl);
-                }}
-              >
-                前往 GitHub 查看
-              </button>
+              {canAutoInstall ? (
+                <>
+                  <button
+                    type="button"
+                    className="settings-secondary-btn"
+                    onClick={() =>
+                      void handleOpenExternal(updateDialog.releaseUrl || GITHUB_REPO_URL)
+                    }
+                    disabled={isDownloadingOrInstalling}
+                  >
+                    前往 GitHub
+                  </button>
+                  <button
+                    type="button"
+                    className="settings-save-btn"
+                    onClick={() => void handleDownloadAndInstall()}
+                    disabled={isDownloadingOrInstalling}
+                  >
+                    {updateProgress?.stage === "downloading"
+                      ? `下载中 ${updateProgress.percent}%`
+                      : updateProgress?.stage === "installing"
+                        ? "正在安装…"
+                        : "下载并自动安装"}
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  className="settings-save-btn"
+                  onClick={() => {
+                    const targetUrl = updateDialog.releaseUrl || GITHUB_REPO_URL;
+                    setUpdateDialog(null);
+                    void handleOpenExternal(targetUrl);
+                  }}
+                >
+                  前往 GitHub 查看
+                </button>
+              )}
             </div>
           </div>
         </div>

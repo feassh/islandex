@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build-windows:
-    name: Build Windows Portable EXE
+    name: Build Windows Portable & Setup EXE
     runs-on: windows-latest
 
     steps:
@@ -56,18 +56,28 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build single-file portable Windows EXE
-        run: npm run tauri build -- --no-bundle
+      - name: Build Windows NSIS Setup & Portable EXE
+        run: npm run tauri build -- --bundles nsis
 
-      - name: Package portable artifact with standard naming
-        id: artifact
+      - name: Package release artifacts with standard naming
         shell: pwsh
         run: |
           $tag = "${{ steps.version.outputs.tag }}"
-          $outName = "Islandex-$tag-windows-x64.exe"
           New-Item -ItemType Directory -Force -Path "release-artifacts" | Out-Null
-          Copy-Item "src-tauri/target/release/islandex.exe" "release-artifacts/$outName" -Force
-          Write-Output "path=release-artifacts/$outName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+          # 1. Single-file portable EXE
+          $portableName = "Islandex-$tag-windows-x64.exe"
+          Copy-Item "src-tauri/target/release/islandex.exe" "release-artifacts/$portableName" -Force
+
+          # 2. NSIS Setup installer EXE (used by in-app auto-updater)
+          $nsisSetup = Get-ChildItem "src-tauri/target/release/bundle/nsis" -Filter "*-setup.exe" | Select-Object -First 1
+          if (-not $nsisSetup) {
+            throw "NSIS setup installer was not generated"
+          }
+          $setupName = "Islandex-$tag-windows-x64-setup.exe"
+          Copy-Item $nsisSetup.FullName "release-artifacts/$setupName" -Force
+
+          Get-ChildItem "release-artifacts" | Select-Object Name, Length
 
       - name: Extract release notes from CHANGELOG.md
         shell: pwsh
@@ -92,4 +102,4 @@ jobs:
           name: "Islandex ${{ steps.version.outputs.tag }}"
           body_path: release_notes.md
           files: |
-            ${{ steps.artifact.outputs.path }}
+            release-artifacts/*

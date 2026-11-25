@@ -20,6 +20,8 @@ pub struct AppSettings {
     pub prompt_timeout_sec: u64,
     /// Music media source filter: `"auto"` (NCM + Apple Music), `"ncm"`, `"apple_music"`, or `"all"`.
     pub music_source: String,
+    /// Whether to radiate keycap particles around the collapsed island when typing.
+    pub enable_typing_effect: bool,
 }
 
 impl Default for AppSettings {
@@ -33,6 +35,7 @@ impl Default for AppSettings {
             target_language: "auto".to_string(),
             prompt_timeout_sec: 10,
             music_source: "auto".to_string(),
+            enable_typing_effect: true,
         }
     }
 }
